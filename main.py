@@ -23,7 +23,7 @@ def measure_high_time(wire):
     return (perf_counter() - start) * 1000
 
 
-class System:
+class MCU:
     def __init__(self, name, lines_with_names):
         self.name = name
         self.interrupt_event = Event()
@@ -111,8 +111,8 @@ if __name__ == "__main__":
     shared_line_2 = UnreliableSharedLine(manager, failure_rate=0.2)
 
     # Beide Systeme teilen sich die Leitungen
-    systemA = System("A", [("shared_1", shared_line_1), ("shared_2", shared_line_2)])
-    systemB = System("B", [("shared_1", shared_line_1), ("shared_2", shared_line_2)])
+    MCUA = MCU("A", [("shared_1", shared_line_1), ("shared_2", shared_line_2)])
+    MCUB = MCU("B", [("shared_1", shared_line_1), ("shared_2", shared_line_2)])
 
     # Gemeinsame Toggler für dieselben Leitungen
     toggler = Process(target=toggle_lines, args=("COMMON", [
@@ -121,19 +121,19 @@ if __name__ == "__main__":
     ]))
 
     # Start Systeme & Test
-    systemA.start()
-    systemB.start()
+    MCUA.start()
+    MCUB.start()
     toggler.start()
 
     toggler.join()
 
-    # Systeme beenden
-    systemA.stop()
-    systemB.stop()
-    systemA.join(timeout=0.5)
-    systemB.join(timeout=0.5)
+    # MCUe beenden
+    MCUA.stop()
+    MCUB.stop()
+    MCUA.join(timeout=0.5)
+    MCUB.join(timeout=0.5)
 
-    systemA.terminate()
-    systemB.terminate()
+    MCUA.terminate()
+    MCUB.terminate()
 
     manager.shutdown()
