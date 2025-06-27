@@ -102,7 +102,7 @@ def toggle_lines(system_name, line_defs):
 
 
 if __name__ == "__main__":
-    set_start_method("fork")  # wichtig für macOS/Linux
+    set_start_method("fork")  # important for multiprocessing on Unix-like systems
 
     manager = Manager()
 
