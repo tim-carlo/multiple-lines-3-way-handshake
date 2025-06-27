@@ -4,13 +4,24 @@ from time import sleep, perf_counter
 import random
 from ctypes import c_bool, c_char_p
 
+# Zustände
+INIT = 0
+RESPONDER = 1
+INITIATOR = 2
+ERROR_MODE = 3
+SUCCESS = 4
 
 # Parameter
-MAX_START_DELAY = 10     # Sekunden
-SYN_DURATION = 0.050     # Sekunden (50ms)
-ACK_DURATION = 0.100     # Sekunden (100ms)
-TIMEOUT = 5              # Sekunden (Timeout für ACK)
+SYN_DURATION = 0.050
+ACK_DURATION = 0.100
+FINAL_ACK_DURATION = 0.150
+TIMEOUT = 5
+MAX_ATTEMPTS = 10
 
+# Zeitfenster (Slots)
+TIME_SLOT_STEP_MS = 200
+MAX_SLOT_MS = 1000
+TIME_SLOTS_MS = list(range(0, MAX_SLOT_MS + 1, TIME_SLOT_STEP_MS))
 
 class MCU:
     def __init__(self, name, lines_with_names, manager):
@@ -21,22 +32,29 @@ class MCU:
         self.previous_states = {}
         self.stop_event = Event()
 
-        # Gemeinsame Statuswerte
         self.role = manager.Value(c_char_p, b"")
         self.handshake_successful = manager.Value(c_bool, False)
         self.syn_sent_time = manager.Value("d", 0.0)
         self.syn_received_time = manager.Value("d", 0.0)
         self.ack_received = manager.Value(c_bool, False)
+        self.final_ack_received = manager.Value(c_bool, False)
 
-        self.my_line_name, self.my_line = random.choice(self.lines)
+        self.blacklist = manager.list()
+        self.my_line_name, self.my_line = self._choose_line()
+
+        self.state = manager.Value("i", INIT)
+
+    def _choose_line(self):
+        available = [(n, l) for n, l in self.lines if n not in self.blacklist]
+        if not available:
+            return random.choice(self.lines)
+        return random.choice(available)
 
     def start(self):
         self.mcu_process = Process(target=self._run_mcu)
         self.peripheral_process = Process(target=self._run_peripheral)
-        self.signal_process = Process(target=self._signal_logic)
         self.mcu_process.start()
         self.peripheral_process.start()
-        self.signal_process.start()
 
     def stop(self):
         self.stop_event.set()
@@ -45,48 +63,121 @@ class MCU:
     def join(self, timeout=None):
         self.mcu_process.join(timeout)
         self.peripheral_process.join(timeout)
-        self.signal_process.join(timeout)
 
     def terminate(self):
-        for p in [self.mcu_process, self.peripheral_process, self.signal_process]:
+        for p in [self.mcu_process, self.peripheral_process]:
             if p.is_alive():
                 p.terminate()
 
     def _run_mcu(self):
-        print(f"[{self.name}-MCU] Booting... will use line: {self.my_line_name}", flush=True)
-        while not self.stop_event.is_set():
-            self.interrupt_event.wait()
-            if self.stop_event.is_set():
-                break
-            while not self.interrupt_queue.empty():
-                irq_info = self.interrupt_queue.get()
-                print(f"[{self.name}-MCU] Interrupt: Line '{irq_info['line']}' - {irq_info['edge']}", flush=True)
-                self._handle_interrupt(irq_info)
-            self.interrupt_event.clear()
+        print(f"[{self.name}-MCU] Booting... using line: {self.my_line_name}", flush=True)
+
+        attempt = 0
+        while not self.stop_event.is_set() and attempt < MAX_ATTEMPTS:
+            self.syn_sent_time.value = 0.0
+            self.syn_received_time.value = 0.0
+            self.ack_received.value = False
+            self.final_ack_received.value = False
+            self.role.value = b""
+            self.handshake_successful.value = False
+            self.state.value = INIT
+
+            slot_ms = random.choice(TIME_SLOTS_MS)
+            print(f"[{self.name}] Slot ausgewählt: {slot_ms} ms", flush=True)
+            sleep(slot_ms / 1000.0)
+
+            if self.state.value == INIT:
+                print(f"[{self.name}] Versuch {attempt + 1}: sende SYN", flush=True)
+                self.state.value = INITIATOR
+                self.syn_sent_time.value = perf_counter()
+                self.my_line.pull_high(self.name)
+                sleep(SYN_DURATION)
+                self.my_line.release(self.name)
+
+            timeout_timer = perf_counter()
+            while perf_counter() - timeout_timer < TIMEOUT:
+                # Verarbeite eingehende Interrupts
+                while not self.interrupt_queue.empty():
+                    irq_info = self.interrupt_queue.get()
+                    self._handle_interrupt(irq_info)
+
+                if self.state.value == RESPONDER:
+                    if self.role.value != b"responder":
+                        self.role.value = b"responder"
+                        line = dict(self.lines)[self.received_line_name]
+                        sleep(random.uniform(0.01, 0.05))
+                        line.pull_high(self.name)
+                        sleep(ACK_DURATION)
+                        line.release(self.name)
+
+                elif self.state.value == INITIATOR and self.ack_received.value:
+                    self.role.value = b"initiator"
+                    sleep(0.05)
+                    self.my_line.pull_high(self.name)
+                    sleep(FINAL_ACK_DURATION)
+                    self.my_line.release(self.name)
+                    self.handshake_successful.value = True
+                    self.state.value = SUCCESS
+                    break
+
+                elif self.state.value == RESPONDER and self.final_ack_received.value:
+                    self.handshake_successful.value = True
+                    self.state.value = SUCCESS
+                    break
+
+                sleep(0.01)
+
+            if self.handshake_successful.value:
+                print(f"[{self.name}] ✅ Handshake erfolgreich als {self.role.value.decode()}.", flush=True)
+                return
+            else:
+                print(f"[{self.name}] ❌ Handshake fehlgeschlagen, Leitung blacklisten: {self.my_line_name}", flush=True)
+                if self.my_line_name not in self.blacklist:
+                    self.blacklist.append(self.my_line_name)
+                self.my_line_name, self.my_line = self._choose_line()
+                attempt += 1
+                self.state.value = ERROR_MODE
+
+        print(f"[{self.name}] ⛔ Handshake gescheitert nach {MAX_ATTEMPTS} Versuchen.", flush=True)
 
     def _handle_interrupt(self, info):
         now = perf_counter()
-        if info['edge'] == "INITIAL":
+        line_name = info['line']
+        edge_type = info['edge']
+
+        if edge_type == "SYN":
+            if self.state.value == INITIATOR:
+                delta = now - self.syn_sent_time.value
+                if delta < 0.020:
+                    print(f"[{self.name}] (IGNORIERT) Eigener SYN erkannt auf {line_name} (Δ={delta*1000:.1f} ms)", flush=True)
+                    return
             if self.syn_received_time.value == 0.0:
                 self.syn_received_time.value = now
-                print(f"[{self.name}-MCU] SYN empfangen von {info['line']}", flush=True)
-                # Nur ACK senden, wenn man vorher kein SYN gesendet hat
-                if self.syn_sent_time.value == 0.0:
-                    self.role.value = b"responder"
-                    line = dict(self.lines)[info['line']]
-                    sleep(random.uniform(0.01, 0.05))
-                    line.pull_high(self.name)
-                    sleep(ACK_DURATION)
-                    line.release(self.name)
+                self.state.value = RESPONDER
+                self.received_line_name = line_name
+                print(f"[{self.name}] SYN empfangen von {line_name}", flush=True)
 
-        elif info['edge'] == "ACK":
+        elif edge_type == "ACK":
+            if self.role.value == b"responder":
+                delta = now - self.syn_received_time.value
+                if delta < 0.020:
+                    print(f"[{self.name}] (IGNORIERT) Eigener ACK erkannt (Δ={delta*1000:.1f} ms)", flush=True)
+                    return
             self.ack_received.value = True
-            print(f"[{self.name}-MCU] ACK empfangen", flush=True)
+            print(f"[{self.name}] ACK empfangen", flush=True)
+
+        elif edge_type == "FINAL_ACK":
+            if self.role.value == b"initiator":
+                delta = now - self.syn_sent_time.value
+                if delta < 0.050:
+                    print(f"[{self.name}] (IGNORIERT) Eigener FINAL_ACK erkannt (Δ={delta*1000:.1f} ms)", flush=True)
+                    return
+            self.final_ack_received.value = True
+            print(f"[{self.name}] FINAL_ACK empfangen", flush=True)
 
     def _run_peripheral(self):
         start_times = {name: None for name, _ in self.lines}
         self.previous_states = {name: line.state() for name, line in self.lines}
-        print(f"[{self.name}-Peripheral] Monitoring started.", flush=True)
         while not self.stop_event.is_set():
             sleep(0.01)
             for name, line in self.lines:
@@ -97,9 +188,11 @@ class MCU:
                 elif prev == 1 and curr == 0 and start_times[name] is not None:
                     duration_ms = (perf_counter() - start_times[name]) * 1000
                     if abs(duration_ms - 50) < 20:
-                        edge_type = "INITIAL"
+                        edge_type = "SYN"
                     elif abs(duration_ms - 100) < 30:
                         edge_type = "ACK"
+                    elif abs(duration_ms - 150) < 30:
+                        edge_type = "FINAL_ACK"
                     else:
                         edge_type = f"DURATION_{duration_ms:.1f}ms"
                     self._trigger_interrupt(name, edge_type)
@@ -111,74 +204,27 @@ class MCU:
         self.interrupt_queue.put(irq_info)
         self.interrupt_event.set()
 
-    def _signal_logic(self):
-        delay = random.uniform(0, MAX_START_DELAY)
-        print(f"[{self.name}] Warte {delay:.2f}s vor möglichem SYN", flush=True)
-        sleep(delay)
-
-        # Nur senden, wenn vorher kein SYN empfangen wurde
-        if self.syn_received_time.value == 0.0:
-            print(f"[{self.name}] Sende SYN auf {self.my_line_name}", flush=True)
-            self.syn_sent_time.value = perf_counter()
-            self.my_line.pull_high(self.name)
-            sleep(SYN_DURATION)
-            self.my_line.release(self.name)
-
-        # Warten auf ACK
-        print(f"[{self.name}] Warte auf ACK...", flush=True)
-        start = perf_counter()
-        while (perf_counter() - start) < TIMEOUT:
-            if self.ack_received.value:
-                self.handshake_successful.value = True
-                break
-            sleep(0.01)
-
-        # Rolle bestimmen, falls noch nicht geschehen
-        if self.role.value == b"":
-            s_sent = self.syn_sent_time.value
-            s_recv = self.syn_received_time.value
-            if s_sent > 0 and s_recv > 0:
-                self.role.value = b"initiator" if s_sent < s_recv else b"responder"
-            elif s_sent > 0:
-                self.role.value = b"initiator"
-            elif s_recv > 0:
-                self.role.value = b"responder"
-            else:
-                self.role.value = b"unknown"
-
-        # Ausgabe
-        if self.handshake_successful.value:
-            print(f"[{self.name}] ✅ Handshake erfolgreich als {self.role.value.decode()}.", flush=True)
-        else:
-            print(f"[{self.name}] ❌ Handshake fehlgeschlagen als {self.role.value.decode()}.", flush=True)
-            
 if __name__ == "__main__":
-    set_start_method("fork")  # unter Windows ggf. "spawn"
-
+    set_start_method("fork")
     manager = Manager()
 
-    shared_line_1 = UnreliableSharedLine(manager, failure_rate=0.1)  # 10% Ausfallrate
-    shared_line_2 = SharedLine(manager)
-    shared_line_3 = OneWaySharedLine(manager, "A")  # Einweg-Leitung von A zu B
-    shared_line_4 = OneWaySharedLine(manager, "B")  # Einweg-Leitung von B zu A
-    shared_line_5 = SharedLine(manager)  # Zusätzliche gemeinsame Leitung
-    shared_line_6 = SharedLine(manager)  # Weitere gemeinsame Leitung
-    shared_line_7 = UnreliableSharedLine(manager, failure_rate=0.2)  # 20% Ausfallrate
+    lines = [
+        ("L1", SharedLine(manager)),
+        ("L2", SharedLine(manager)),
+        ("L4", SharedLine(manager)),
+    ]
 
-    # Zwei MCUs mit synchronisierten Statuswerten
-    mcu_a = MCU("A", [("Line1", shared_line_1), ("Line2", shared_line_2), ("Line3", shared_line_3), ("Line4", shared_line_4)], manager)
-    mcu_b = MCU("B", [("Line1", shared_line_1), ("Line2", shared_line_2), ("Line3", shared_line_3), ("Line4", shared_line_4), ("Line5", shared_line_5), ("Line6", shared_line_6), ("Line7", shared_line_7)], manager)
+    mcu_a = MCU("A", lines, manager)
+    mcu_b = MCU("B", lines, manager)
 
-    # Starten
     mcu_a.start()
     mcu_b.start()
 
     try:
-        sleep(15)
+        sleep(20)
     except KeyboardInterrupt:
         pass
 
-    # Stoppen & Warten
     mcu_a.stop()
     mcu_b.stop()
     mcu_a.join()
@@ -186,7 +232,6 @@ if __name__ == "__main__":
     mcu_a.terminate()
     mcu_b.terminate()
 
-    # Ergebnisse anzeigen
     print("\n[ERGEBNISSE]")
     print(f"{mcu_a.name}: Rolle = {mcu_a.role.value.decode()}, Erfolg = {mcu_a.handshake_successful.value}")
     print(f"{mcu_b.name}: Rolle = {mcu_b.role.value.decode()}, Erfolg = {mcu_b.handshake_successful.value}")
