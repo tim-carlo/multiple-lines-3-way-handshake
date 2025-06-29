@@ -2,12 +2,15 @@ import random
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
+from time import sleep, perf_counter
 
 class SharedLine:
     def __init__(self, manager, name="SharedLine"):
         self.holders = manager.list()
         self.data_log = manager.list()
         self.name = name
+        self.start_time = perf_counter()
+        self._log_state()
 
     def pull_high(self, name):
         if name not in self.holders:
@@ -24,7 +27,7 @@ class SharedLine:
 
     def _log_state(self):
         self.data_log.append({
-            'timestamp': datetime.now(),
+            'timestamp': (perf_counter() - self.start_time) * 1000,  # milliseconds
             'state': self.state(),
             'holders_count': len(self.holders)
         })
@@ -39,6 +42,7 @@ class OneWaySharedLine:
         self._sender_name = sender_name
         self.data_log = manager.list()
         self.name = name
+        self.start_time = perf_counter()
 
     def pull_high(self, name):
         if name == self._sender_name:
@@ -55,7 +59,7 @@ class OneWaySharedLine:
 
     def _log_state(self):
         self.data_log.append({
-            'timestamp': datetime.now(),
+            'timestamp': (perf_counter() - self.start_time) * 1000,  # milliseconds
             'state': self.state(),
             'sender': self._sender_name
         })
@@ -70,6 +74,7 @@ class UnreliableSharedLine:
         self.failure_rate = failure_rate
         self.data_log = manager.list()
         self.name = name
+        self.start_time = perf_counter()
 
     def pull_high(self, name):
         if name not in self.holders:
@@ -90,7 +95,7 @@ class UnreliableSharedLine:
         actual_state = 1 if len(self.holders) > 0 else 0
         reported_state = 0 if random.random() < self.failure_rate else actual_state
         self.data_log.append({
-            'timestamp': datetime.now(),
+            'timestamp': (perf_counter() - self.start_time) * 1000,  # milliseconds
             'actual_state': actual_state,
             'reported_state': reported_state,
             'failed': actual_state != reported_state,
@@ -110,57 +115,63 @@ class MultiLinePlotter:
     def add_lines(self, lines):
         self.lines.extend(lines)
     
+
     def plot_all(self, figsize=(15, 10)):
         if not self.lines:
             print("No lines to plot")
             return
-        
+
         num_lines = len(self.lines)
-        rows = (num_lines + 1) // 2  # Calculate rows needed for 2 columns
-        
+        rows = (num_lines + 1) // 2  # Zwei Spalten
+
         fig, axes = plt.subplots(rows, 2, figsize=figsize)
-        fig.suptitle('All Shared Lines State Overview', fontsize=16)
-        
-        # Handle single row case and ensure axes is always 2D
+        fig.suptitle('Shared Lines', fontsize=16)
+
+        # Stelle sicher, dass axes immer 2D ist
         if rows == 1 and num_lines == 1:
-            # Special case: only one subplot needed
             axes = [[axes]]
         elif rows == 1:
             axes = axes.reshape(1, -1)
-        
+
         for i, line in enumerate(self.lines):
             row = i // 2
             col = i % 2
             ax = axes[row][col]
-            
+
             if not line.data_log:
                 ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
                 ax.set_title(f'{line.name} - No Data')
+                ax.axis('off')
                 continue
-            
+
             df = line.get_dataframe()
-            # Handle different line types
+
             if isinstance(line, UnreliableSharedLine):
-                ax.plot(df['timestamp'], df['actual_state'], label='Actual', alpha=0.7)
-                ax.plot(df['timestamp'], df['reported_state'], label='Reported', alpha=0.7)
-                # Mark failures
+                # Step-Plots für 'actual' und 'reported' Zustand
+                ax.step(df['timestamp'], df['actual_state'], where='post', label='Actual', alpha=0.7)
+                ax.step(df['timestamp'], df['reported_state'], where='post', label='Reported', alpha=0.7)
+
+                # Fehlerpunkte als Scatter
                 failures = df[df['failed'] == True]
                 if not failures.empty:
                     ax.scatter(failures['timestamp'], failures['reported_state'], 
-                             color='red', s=20, label='Failures', zorder=5)
+                            color='red', s=20, label='Failures', zorder=5)
                 ax.legend()
             else:
                 state_col = 'state' if 'state' in df.columns else 'reported_state'
-                ax.plot(df['timestamp'], df[state_col], alpha=0.7)
-            
-            ax.set_title(line.name)
-            ax.set_xlabel('Time')
+                ax.step(df['timestamp'], df[state_col], where='post', alpha=0.9)
+
+            ax.set_title(f'{line.name}')
+            ax.set_xlabel('Time (ms)')
             ax.set_ylabel('State')
-            ax.set_ylim(-0.1, 1.1)
-        
-        # Hide empty subplots if odd number of lines
+            ax.set_yticks([0, 1])
+            ax.set_yticklabels(['LOW', 'HIGH'])
+            ax.set_ylim(-0.2, 1.2)
+            ax.grid(True, which='both', linestyle='--', alpha=0.3)
+
+        # Leeres Subplot ausblenden bei ungerader Zahl
         if num_lines % 2 == 1 and num_lines > 1:
             axes[rows-1][1].set_visible(False)
-        
-        plt.tight_layout()
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.show()
