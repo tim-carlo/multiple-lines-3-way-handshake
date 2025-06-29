@@ -5,9 +5,9 @@ from ctypes import c_bool
 from shared_lines import SharedLine
 
 # Signal Timings (ms)
-SYN_DURATION = 50
-SYN_ACK_DURATION = 100
-ACK_DURATION = 150
+SYN_DURATION = 500
+SYN_ACK_DURATION = 1000
+ACK_DURATION = 1500
 TOLERANCE = 20
 
 # Time Slots in ms
@@ -44,9 +44,16 @@ class MCU:
         self.last_sent_time = manager.Value('d', 0.0)
 
         self.received_syn = manager.Value(c_bool, False)
-        self.received_syn_ack = manager.Value(c_bool, False)
-        self.received_ack = manager.Value(c_bool, False)
         self.received_syn_on = manager.Value('u', '')
+        
+        self.received_syn_ack = manager.Value(c_bool, False)
+        self.received_syn_ack_on = manager.Value('u', '')
+        
+        self.received_ack = manager.Value(c_bool, False)
+        self.received_ack_on = manager.Value('u', '')
+        
+        
+        
 
     @property
     def current_line_obj(self):
@@ -100,26 +107,27 @@ class MCU:
                     sleep(0.0001)
                     
                     
-                if self.state.value == MAYBE_RESPONDER:
-                    continue    
+                if self.state.value != INIT:
+                    continue
 
                 if self.state.value != INIT:
                     print(f"[{self.name}] Interrupt verarbeitet, State ist jetzt {self.state.value}", flush=True)
                     continue
                 
                 self.current_line_obj.pull_high(self.name)
+                print(f"[{self.name}] Send SYN on {self.current_line}", flush=True)
                 sleep(SYN_DURATION / 1000.0)
                 self.last_sent_time.value = perf_counter()
-                
                 self.current_line_obj.release(self.name)
+                print(f"[{self.name}] SYN gesendet auf {self.current_line}", flush=True)
+               
                 self.state.value = INITIATOR
                 self.role.value = 'initiator'
                 
             elif state == MAYBE_RESPONDER:
                 responding_timeout = perf_counter() + 1.0  # Reduced timeout
-                print(f"[{self.name}] Waiting for SYN signal on {self.current_line}", flush=True)
 
-                while perf_counter() < responding_timeout and not self.stop_event.is_set():
+                while perf_counter() < responding_timeout:
                     self._process_interrupts()
                     
                     # Check if we received a SYN signal
@@ -132,16 +140,16 @@ class MCU:
                         break
                     
                     # Check if line becomes inactive (potential false alarm)
-                    if self.current_line_obj and self.current_line_obj.state() == 0:
-                        print(f"[{self.name}] Line {self.current_line} became inactive, false alarm", flush=True)
-                        self._reset_state()
-                        break
+                    # if self.current_line_obj and self.current_line_obj.state() == 0:
+                    #     print(f"[{self.name}] Line {self.current_line} became inactive, false alarm", flush=True)
+                    #     self._reset_state()
+                    #     break
                         
-                    sleep(0.001)  # Increased sleep for better performance
+                    sleep(0.0001)  # Increased sleep for better performance
                 else:
                     if not self.stop_event.is_set():
                         print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
-                        self.state.value = INIT
+                        self._reset_state()
                         
                     
             elif state == INITIATOR:
@@ -150,11 +158,10 @@ class MCU:
 
                 while perf_counter() < timeout:
                     self._process_interrupts()
-                    if self.received_syn_ack.value:
+                    if self.received_syn_ack.value and self.received_syn_ack_on.value == self.current_line:
                         print(f"[{self.name}] SYN_ACK empfangen auf {self.current_line}", flush=True)
                         self.received_syn_ack.value = False
-                        self.received_ack.value = False
-                        self.received_syn_on.value = self.current_line
+                        self.received_syn_ack_on.value = ''
                         
                         
                         
@@ -163,17 +170,21 @@ class MCU:
                         sleep(ACK_DURATION / 1000.0)
                         self.last_sent_time.value = perf_counter()
                         self.current_line_obj.release(self.name)
+                
+                        self.state.value = SUCCESS
+                        print(f"[{self.name}] ACK gesendet auf {self.current_line}", flush=True)
                         break
-                    sleep(0.001)
+                    sleep(0.0001)
                 else:
                     print(f"[{self.name}] Timeout beim Warten auf SYN_ACK auf {self.current_line}", flush=True)
                     self.state.value = FAILED
                     self.received_syn_ack.value = False
-                    self.received_ack.value = False
-                    self.received_syn_on.value = ''
+                    self.received_syn_ack_on.value = ''
 
             elif state == RESPONDER:
                 self.last_sent_time.value = perf_counter()
+                
+                print(f"[{self.name}] Senddddddddddd SYN ACK on {self.current_line}", flush=True)
                 self.current_line_obj.pull_high(self.name)
                 sleep(SYN_ACK_DURATION / 1000.0)
                 self.last_sent_time.value = perf_counter()
@@ -184,13 +195,17 @@ class MCU:
 
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
-                    if self.received_ack.value:
+                    if self.received_ack.value and self.received_ack_on.value == self.current_line:
+                        self.received_ack.value = False
+                        self.received_ack_on.value = ''
                         print(f"[{self.name}] ACK empfangen auf {self.current_line}", flush=True)
                         self.state.value = SUCCESS
                         break
                     sleep(0.001)
                 else:
                     print(f"[{self.name}] Timeout beim Warten auf ACK auf {self.current_line}", flush=True)
+                    self.received_ack.value = False
+                    self.received_ack_on.value = ''
                     self.state.value = FAILED
 
             elif state == SUCCESS:
@@ -215,6 +230,12 @@ class MCU:
         self.received_syn_on.value = ''
         self.received_syn_ack.value = False
         self.received_ack.value = False
+        self.received_ack_on.value = ''
+        self.received_syn.value = False
+        self.received_syn_ack_on.value = ''
+        self.received_ack_on.value = ''
+        self.last_sent_time.value = 0.0
+        
         self.role.value = ''
 
     def _process_interrupts(self):
@@ -222,21 +243,21 @@ class MCU:
             line_name, edge_type, duration = self.interrupt_queue.get()
             if abs(perf_counter() - self.last_sent_time.value) < 0.2:
                 continue
-
+                
             if edge_type == "SYN":
                 print(f"[{self.name}] Empfangener SYN auf {line_name}", flush=True)
                 self.received_syn.value = True
                 self.current_line = line_name
-                self.role.value = 'responder'
-                self.state.value = RESPONDER
 
-            elif edge_type == "SYN_ACK" and line_name == self.current_line:
+            elif edge_type == "SYN_ACK":
                 print(f"[{self.name}] Empfangener SYN_ACK auf {line_name}", flush=True)
                 self.received_syn_ack.value = True
+                self.received_syn_ack_on.value = line_name
 
-            elif edge_type == "ACK" and line_name == self.current_line:
+            elif edge_type == "ACK":
                 print(f"[{self.name}] Empfangener ACK auf {line_name} (Initiator)", flush=True)
                 self.received_ack.value = True
+                self.received_ack_on.value = line_name
 
     def _peripheral(self):
         durations = {name: None for name in self.all_lines.keys()}
