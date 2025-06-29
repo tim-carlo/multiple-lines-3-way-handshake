@@ -1,239 +1,286 @@
-from shared_lines import SharedLine, UnreliableSharedLine, OneWaySharedLine
 from multiprocessing import Process, Event, Queue, Manager, set_start_method
 from time import sleep, perf_counter
 import random
-from ctypes import c_bool, c_char_p
+from ctypes import c_bool
+from shared_lines import SharedLine
 
-# Zustände
+# Signal Timings (ms)
+SYN_DURATION = 50
+SYN_ACK_DURATION = 100
+ACK_DURATION = 150
+TOLERANCE = 20
+
+# Time Slots in ms
+TIME_SLOTS_MS = list(range(0, 1000, 10))
+
+# FSM States
 INIT = 0
-RESPONDER = 1
-INITIATOR = 2
-ERROR_MODE = 3
-SUCCESS = 4
+INITIATOR = 1
+RESPONDER = 2
+SUCCESS = 3
+FAILED = 4
 
-# Parameter
-SYN_DURATION = 0.050
-ACK_DURATION = 0.100
-FINAL_ACK_DURATION = 0.150
-TIMEOUT = 5
-MAX_ATTEMPTS = 10
-
-# Zeitfenster (Slots)
-TIME_SLOT_STEP_MS = 200
-MAX_SLOT_MS = 1000
-TIME_SLOTS_MS = list(range(0, MAX_SLOT_MS + 1, TIME_SLOT_STEP_MS))
+MAYBE_RESPONDER = 5
 
 class MCU:
-    def __init__(self, name, lines_with_names, manager):
+    def __init__(self, name, line_names, manager):
         self.name = name
-        self.interrupt_event = Event()
+        self.manager = manager
         self.interrupt_queue = Queue()
-        self.lines = lines_with_names
-        self.previous_states = {}
+        self.interrupt_event = Event()
         self.stop_event = Event()
 
-        self.role = manager.Value(c_char_p, b"")
-        self.handshake_successful = manager.Value(c_bool, False)
-        self.syn_sent_time = manager.Value("d", 0.0)
-        self.syn_received_time = manager.Value("d", 0.0)
-        self.ack_received = manager.Value(c_bool, False)
-        self.final_ack_received = manager.Value(c_bool, False)
+        self.white_list = manager.list()
+        self.black_list = manager.list()
+        self.all_lines = {ln: obj for ln, obj in line_names}
 
-        self.blacklist = manager.list()
-        self.my_line_name, self.my_line = self._choose_line()
+        self.current_line = None
+        self.state = manager.Value('i', INIT)
+        self.role = manager.Value('u', '')
 
-        self.state = manager.Value("i", INIT)
+        self.successful_lines = manager.list()
+        self.start_times = manager.dict()
+        self.previous_states = {name: 0 for name, _ in line_names}
+        self.last_sent_time = manager.Value('d', 0.0)
 
-    def _choose_line(self):
-        available = [(n, l) for n, l in self.lines if n not in self.blacklist]
-        if not available:
-            return random.choice(self.lines)
-        return random.choice(available)
+        self.received_syn = manager.Value(c_bool, False)
+        self.received_syn_ack = manager.Value(c_bool, False)
+        self.received_ack = manager.Value(c_bool, False)
+        self.received_syn_on = manager.Value('u', '')
+
+    @property
+    def current_line_obj(self):
+        return self.all_lines.get(self.current_line)
 
     def start(self):
-        self.mcu_process = Process(target=self._run_mcu)
-        self.peripheral_process = Process(target=self._run_peripheral)
-        self.mcu_process.start()
-        self.peripheral_process.start()
+        self.p1 = Process(target=self._run_logic)
+        self.p2 = Process(target=self._peripheral)
+        self.p1.start()
+        self.p2.start()
+
+    def join(self):
+        self.p1.join()
+        self.p2.join()
 
     def stop(self):
         self.stop_event.set()
         self.interrupt_event.set()
 
-    def join(self, timeout=None):
-        self.mcu_process.join(timeout)
-        self.peripheral_process.join(timeout)
+    def _run_logic(self):
+        tested = set()
+        slot = None
+        slot_start = None
+        timeout = None
+        responding_timeout = None
 
-    def terminate(self):
-        for p in [self.mcu_process, self.peripheral_process]:
-            if p.is_alive():
-                p.terminate()
+        while len(tested) < len(self.all_lines):
+            self._process_interrupts()
+            state = self.state.value
 
-    def _run_mcu(self):
-        print(f"[{self.name}-MCU] Booting... using line: {self.my_line_name}", flush=True)
+            if state == INIT:
+                available = [ln for ln in self.all_lines.keys() if ln not in tested]
+                if not available:
+                    break
 
-        attempt = 0
-        while not self.stop_event.is_set() and attempt < MAX_ATTEMPTS:
-            self.syn_sent_time.value = 0.0
-            self.syn_received_time.value = 0.0
-            self.ack_received.value = False
-            self.final_ack_received.value = False
-            self.role.value = b""
-            self.handshake_successful.value = False
-            self.state.value = INIT
+                self.current_line = random.choice(available)
+                slot = random.choice(TIME_SLOTS_MS)
+                slot_start = perf_counter()
+                responding_timeout = None
+                print(f"[{self.name}] Zeitfenster: {slot} ms für Leitung {self.current_line}", flush=True)
 
-            slot_ms = random.choice(TIME_SLOTS_MS)
-            print(f"[{self.name}] Slot ausgewählt: {slot_ms} ms", flush=True)
-            sleep(slot_ms / 1000.0)
+                while (perf_counter() - slot_start) < slot / 1000.0 and self.state.value == INIT:
+                    self._process_interrupts()
+                    # Check if any line is active and handle potential conflict
+                    active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
+                    if active_lines:
+                        self.current_line = active_lines[0]  # Take the first active line
+                        print(f"[{self.name}] Line active on {self.current_line}, entering MAYBE_RESPONDER state", flush=True)
+                        self.state.value = MAYBE_RESPONDER
+                        break
+                    sleep(0.0001)
+                    
+                    
+                if self.state.value == MAYBE_RESPONDER:
+                    continue    
 
-            if self.state.value == INIT:
-                print(f"[{self.name}] Versuch {attempt + 1}: sende SYN", flush=True)
+                if self.state.value != INIT:
+                    print(f"[{self.name}] Interrupt verarbeitet, State ist jetzt {self.state.value}", flush=True)
+                    continue
+                
+                self.current_line_obj.pull_high(self.name)
+                sleep(SYN_DURATION / 1000.0)
+                self.last_sent_time.value = perf_counter()
+                
+                self.current_line_obj.release(self.name)
                 self.state.value = INITIATOR
-                self.syn_sent_time.value = perf_counter()
-                self.my_line.pull_high(self.name)
-                sleep(SYN_DURATION)
-                self.my_line.release(self.name)
+                self.role.value = 'initiator'
+                
+            elif state == MAYBE_RESPONDER:
+                responding_timeout = perf_counter() + 1.0  # Reduced timeout
+                print(f"[{self.name}] Waiting for SYN signal on {self.current_line}", flush=True)
 
-            timeout_timer = perf_counter()
-            while perf_counter() - timeout_timer < TIMEOUT:
-                # Verarbeite eingehende Interrupts
-                while not self.interrupt_queue.empty():
-                    irq_info = self.interrupt_queue.get()
-                    self._handle_interrupt(irq_info)
+                while perf_counter() < responding_timeout and not self.stop_event.is_set():
+                    self._process_interrupts()
+                    
+                    # Check if we received a SYN signal
+                    if self.received_syn.value:
+                        print(f"[{self.name}] SYN received on {self.current_line}", flush=True)
+                        self.received_syn.value = False
+                        self.state.value = RESPONDER
+                        self.received_syn_on.value = self.current_line
+                        self.role.value = 'responder'
+                        break
+                    
+                    # Check if line becomes inactive (potential false alarm)
+                    if self.current_line_obj and self.current_line_obj.state() == 0:
+                        print(f"[{self.name}] Line {self.current_line} became inactive, false alarm", flush=True)
+                        self._reset_state()
+                        break
+                        
+                    sleep(0.001)  # Increased sleep for better performance
+                else:
+                    if not self.stop_event.is_set():
+                        print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
+                        self.state.value = INIT
+                        
+                    
+            elif state == INITIATOR:
+                timeout = perf_counter() + 2.0
+                print(f"[{self.name}] Warte auf SYN_ACK auf {self.current_line}", flush=True)
 
-                if self.state.value == RESPONDER:
-                    if self.role.value != b"responder":
-                        self.role.value = b"responder"
-                        line = dict(self.lines)[self.received_line_name]
-                        sleep(random.uniform(0.01, 0.05))
-                        line.pull_high(self.name)
-                        sleep(ACK_DURATION)
-                        line.release(self.name)
+                while perf_counter() < timeout:
+                    self._process_interrupts()
+                    if self.received_syn_ack.value:
+                        print(f"[{self.name}] SYN_ACK empfangen auf {self.current_line}", flush=True)
+                        self.received_syn_ack.value = False
+                        self.received_ack.value = False
+                        self.received_syn_on.value = self.current_line
+                        
+                        
+                        
+                        # Send ACK
+                        self.current_line_obj.pull_high(self.name)
+                        sleep(ACK_DURATION / 1000.0)
+                        self.last_sent_time.value = perf_counter()
+                        self.current_line_obj.release(self.name)
+                        break
+                    sleep(0.001)
+                else:
+                    print(f"[{self.name}] Timeout beim Warten auf SYN_ACK auf {self.current_line}", flush=True)
+                    self.state.value = FAILED
+                    self.received_syn_ack.value = False
+                    self.received_ack.value = False
+                    self.received_syn_on.value = ''
 
-                elif self.state.value == INITIATOR and self.ack_received.value:
-                    self.role.value = b"initiator"
-                    sleep(0.05)
-                    self.my_line.pull_high(self.name)
-                    sleep(FINAL_ACK_DURATION)
-                    self.my_line.release(self.name)
-                    self.handshake_successful.value = True
-                    self.state.value = SUCCESS
-                    break
+            elif state == RESPONDER:
+                self.last_sent_time.value = perf_counter()
+                self.current_line_obj.pull_high(self.name)
+                sleep(SYN_ACK_DURATION / 1000.0)
+                self.last_sent_time.value = perf_counter()
+                self.current_line_obj.release(self.name)
 
-                elif self.state.value == RESPONDER and self.final_ack_received.value:
-                    self.handshake_successful.value = True
-                    self.state.value = SUCCESS
-                    break
+                responding_timeout = perf_counter() + 2.0
+                print(f"[{self.name}] Warte auf ACK auf {self.current_line}", flush=True)
 
-                sleep(0.01)
+                while perf_counter() < responding_timeout:
+                    self._process_interrupts()
+                    if self.received_ack.value:
+                        print(f"[{self.name}] ACK empfangen auf {self.current_line}", flush=True)
+                        self.state.value = SUCCESS
+                        break
+                    sleep(0.001)
+                else:
+                    print(f"[{self.name}] Timeout beim Warten auf ACK auf {self.current_line}", flush=True)
+                    self.state.value = FAILED
 
-            if self.handshake_successful.value:
-                print(f"[{self.name}] ✅ Handshake erfolgreich als {self.role.value.decode()}.", flush=True)
-                return
-            else:
-                print(f"[{self.name}] ❌ Handshake fehlgeschlagen, Leitung blacklisten: {self.my_line_name}", flush=True)
-                if self.my_line_name not in self.blacklist:
-                    self.blacklist.append(self.my_line_name)
-                self.my_line_name, self.my_line = self._choose_line()
-                attempt += 1
-                self.state.value = ERROR_MODE
+            elif state == SUCCESS:
+                print(f"[{self.name}] ✅ {self.current_line} funktioniert als {self.role.value}", flush=True)
+                self.successful_lines.append(self.current_line)
+                self.white_list.append(self.current_line)
+                tested.add(self.current_line)
+                self._reset_state()
 
-        print(f"[{self.name}] ⛔ Handshake gescheitert nach {MAX_ATTEMPTS} Versuchen.", flush=True)
+            elif state == FAILED:
+                print(f"[{self.name}] ❌ {self.current_line} fehlgeschlagen als {self.role.value}", flush=True)
+                self.black_list.append(self.current_line)
+                tested.add(self.current_line)
+                self._reset_state()
+                sleep(0.005)
 
-    def _handle_interrupt(self, info):
-        now = perf_counter()
-        line_name = info['line']
-        edge_type = info['edge']
+        print(f"[{self.name}] Erfolgreiche Leitungen: {list(self.successful_lines)}", flush=True)
 
-        if edge_type == "SYN":
-            if self.state.value == INITIATOR:
-                delta = now - self.syn_sent_time.value
-                if delta < 0.020:
-                    print(f"[{self.name}] (IGNORIERT) Eigener SYN erkannt auf {line_name} (Δ={delta*1000:.1f} ms)", flush=True)
-                    return
-            if self.syn_received_time.value == 0.0:
-                self.syn_received_time.value = now
+    def _reset_state(self):
+        self.state.value = INIT
+        self.current_line = None
+        self.received_syn_on.value = ''
+        self.received_syn_ack.value = False
+        self.received_ack.value = False
+        self.role.value = ''
+
+    def _process_interrupts(self):
+        while not self.interrupt_queue.empty():
+            line_name, edge_type, duration = self.interrupt_queue.get()
+            if abs(perf_counter() - self.last_sent_time.value) < 0.2:
+                continue
+
+            if edge_type == "SYN":
+                print(f"[{self.name}] Empfangener SYN auf {line_name}", flush=True)
+                self.received_syn.value = True
+                self.current_line = line_name
+                self.role.value = 'responder'
                 self.state.value = RESPONDER
-                self.received_line_name = line_name
-                print(f"[{self.name}] SYN empfangen von {line_name}", flush=True)
 
-        elif edge_type == "ACK":
-            if self.role.value == b"responder":
-                delta = now - self.syn_received_time.value
-                if delta < 0.020:
-                    print(f"[{self.name}] (IGNORIERT) Eigener ACK erkannt (Δ={delta*1000:.1f} ms)", flush=True)
-                    return
-            self.ack_received.value = True
-            print(f"[{self.name}] ACK empfangen", flush=True)
+            elif edge_type == "SYN_ACK" and line_name == self.current_line:
+                print(f"[{self.name}] Empfangener SYN_ACK auf {line_name}", flush=True)
+                self.received_syn_ack.value = True
 
-        elif edge_type == "FINAL_ACK":
-            if self.role.value == b"initiator":
-                delta = now - self.syn_sent_time.value
-                if delta < 0.050:
-                    print(f"[{self.name}] (IGNORIERT) Eigener FINAL_ACK erkannt (Δ={delta*1000:.1f} ms)", flush=True)
-                    return
-            self.final_ack_received.value = True
-            print(f"[{self.name}] FINAL_ACK empfangen", flush=True)
+            elif edge_type == "ACK" and line_name == self.current_line:
+                print(f"[{self.name}] Empfangener ACK auf {line_name} (Initiator)", flush=True)
+                self.received_ack.value = True
 
-    def _run_peripheral(self):
-        start_times = {name: None for name, _ in self.lines}
-        self.previous_states = {name: line.state() for name, line in self.lines}
+    def _peripheral(self):
+        durations = {name: None for name in self.all_lines.keys()}
+
         while not self.stop_event.is_set():
-            sleep(0.01)
-            for name, line in self.lines:
+            for name, line in self.all_lines.items():
+                state = line.state()
                 prev = self.previous_states[name]
-                curr = line.state()
-                if prev == 0 and curr == 1:
-                    start_times[name] = perf_counter()
-                elif prev == 1 and curr == 0 and start_times[name] is not None:
-                    duration_ms = (perf_counter() - start_times[name]) * 1000
-                    if abs(duration_ms - 50) < 20:
-                        edge_type = "SYN"
-                    elif abs(duration_ms - 100) < 30:
-                        edge_type = "ACK"
-                    elif abs(duration_ms - 150) < 30:
-                        edge_type = "FINAL_ACK"
-                    else:
-                        edge_type = f"DURATION_{duration_ms:.1f}ms"
-                    self._trigger_interrupt(name, edge_type)
-                    start_times[name] = None
-                self.previous_states[name] = curr
 
-    def _trigger_interrupt(self, line_name, edge_type):
-        irq_info = {"line": line_name, "edge": edge_type}
-        self.interrupt_queue.put(irq_info)
-        self.interrupt_event.set()
+                if prev == 0 and state == 1:
+                    durations[name] = perf_counter()
+                elif prev == 1 and state == 0 and durations[name] is not None:
+                    duration = (perf_counter() - durations[name]) * 1000
+                    if abs(duration - SYN_DURATION) < TOLERANCE:
+                        etype = "SYN"
+                    elif abs(duration - SYN_ACK_DURATION) < TOLERANCE:
+                        etype = "SYN_ACK"
+                    elif abs(duration - ACK_DURATION) < TOLERANCE:
+                        etype = "ACK"
+                    else:
+                        etype = None
+
+                    if etype:
+                        self.interrupt_queue.put((name, etype, duration))
+                    durations[name] = None
+
+                self.previous_states[name] = state
+            sleep(0.001)
 
 if __name__ == "__main__":
     set_start_method("fork")
     manager = Manager()
+    lines = [("L1", SharedLine(manager)), ("L2", SharedLine(manager)), ("L3", SharedLine(manager))]
 
-    lines = [
-        ("L1", SharedLine(manager)),
-        ("L2", SharedLine(manager)),
-        ("L4", SharedLine(manager)),
-    ]
+    mcu1 = MCU("A", lines, manager)
+    mcu2 = MCU("B", lines, manager)
 
-    mcu_a = MCU("A", lines, manager)
-    mcu_b = MCU("B", lines, manager)
-
-    mcu_a.start()
-    mcu_b.start()
+    mcu1.start()
+    mcu2.start()
 
     try:
-        sleep(20)
-    except KeyboardInterrupt:
-        pass
-
-    mcu_a.stop()
-    mcu_b.stop()
-    mcu_a.join()
-    mcu_b.join()
-    mcu_a.terminate()
-    mcu_b.terminate()
-
-    print("\n[ERGEBNISSE]")
-    print(f"{mcu_a.name}: Rolle = {mcu_a.role.value.decode()}, Erfolg = {mcu_a.handshake_successful.value}")
-    print(f"{mcu_b.name}: Rolle = {mcu_b.role.value.decode()}, Erfolg = {mcu_b.handshake_successful.value}")
-
-    manager.shutdown()
+        sleep(30)
+    finally:
+        mcu1.stop()
+        mcu2.stop()
+        mcu1.join()
+        mcu2.join()
