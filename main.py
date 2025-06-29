@@ -2,13 +2,15 @@ from multiprocessing import Process, Event, Queue, Manager, set_start_method
 from time import sleep, perf_counter
 import random
 from ctypes import c_bool
-from shared_lines import SharedLine
+from shared_lines import SharedLine, OneWaySharedLine, UnreliableSharedLine
 
 # Signal Timings (ms)
 SYN_DURATION = 500
 SYN_ACK_DURATION = 1000
 ACK_DURATION = 1500
 TOLERANCE = 20
+
+LINE_SETTLE_DURATION = 100  # Duration to wait for line to settle after pulling high
 
 # Time Slots in ms
 TIME_SLOTS_MS = list(range(0, 1000, 10))
@@ -19,8 +21,9 @@ INITIATOR = 1
 RESPONDER = 2
 SUCCESS = 3
 FAILED = 4
-
 MAYBE_RESPONDER = 5
+
+
 
 class MCU:
     def __init__(self, name, line_names, manager):
@@ -138,7 +141,6 @@ class MCU:
                         print(f"[{self.name}] Conflict detected on {self.current_line}, switching to MAYBE_RESPONDER", flush=True)
                         self.state.value = MAYBE_RESPONDER
                         break
-                    sleep(0.0001)
                 else:
                     # SYN completed successfully
                     self.last_sent_time.value = perf_counter()
@@ -162,14 +164,6 @@ class MCU:
                         self.received_syn_on.value = self.current_line
                         self.role.value = 'responder'
                         break
-                    
-                    # Check if line becomes inactive (potential false alarm)
-                    # if self.current_line_obj and self.current_line_obj.state() == 0:
-                    #     print(f"[{self.name}] Line {self.current_line} became inactive, false alarm", flush=True)
-                    #     self._reset_state()
-                    #     break
-                        
-                    sleep(0.0001)  # Increased sleep for better performance
                 else:
                     if not self.stop_event.is_set():
                         print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
@@ -198,8 +192,9 @@ class MCU:
                         self.received_syn_ack_on.value = ''
                         
                         
-                        # Send ACK
+                        sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
                         
+                        # Send ACK
                         self.set_curent_line.value = True
                         self.current_line_obj.pull_high(self.name)
                         sleep(ACK_DURATION / 1000.0)
@@ -210,7 +205,6 @@ class MCU:
                         self.state.value = SUCCESS
                         print(f"[{self.name}] ACK sent on {self.current_line}", flush=True)
                         break
-                    sleep(0.0001)
                 else:
                     print(f"[{self.name}] Timeout waiting for SYN_ACK on {self.current_line}", flush=True)
                     self.state.value = FAILED
@@ -228,6 +222,8 @@ class MCU:
                 self.last_sent_time.value = perf_counter()
                 self.current_line_obj.release(self.name)
                 self.set_curent_line.value = False
+                
+                sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
 
                 responding_timeout = perf_counter() + 4.0
                 print(f"[{self.name}] Waiting for ACK on {self.current_line}", flush=True)
@@ -240,7 +236,6 @@ class MCU:
                         print(f"[{self.name}] ACK received on {self.current_line}", flush=True)
                         self.state.value = SUCCESS
                         break
-                    sleep(0.001)
                 else:
                     print(f"[{self.name}] Timeout waiting for ACK on {self.current_line}", flush=True)
                     self.received_ack.value = False
@@ -344,8 +339,8 @@ if __name__ == "__main__":
         "L3": SharedLine(manager),
         "L4": SharedLine(manager),
         "L5": SharedLine(manager),
-        "L6": SharedLine(manager, unreliable=True),  # Unreliable line
-        "L7": SharedLine(manager, one_way=True)      # One-way line
+        "L6": UnreliableSharedLine(manager, failure_rate=0.1),  # Unreliable line
+        "L7": OneWaySharedLine(manager, sender_name="A")  # One
     }
     
     # Define lines for each controller
@@ -353,17 +348,17 @@ if __name__ == "__main__":
         ("L1", shared_lines["L1"]),
         ("L2", shared_lines["L2"]),
         ("L3", shared_lines["L3"]),
-        ("L5", shared_lines["L5"]),
-        ("L6", shared_lines["L6"]),
-        ("L7", shared_lines["L7"])
+       # ("L5", shared_lines["L5"]),
+       # ("L6", shared_lines["L6"]),
+       # ("L7", shared_lines["L7"])
     ]
     
     lines_controller2 = [
         ("L1", shared_lines["L1"]),
         ("L2", shared_lines["L2"]),
         ("L3", shared_lines["L3"]),
-        ("L4", shared_lines["L4"]),
-        ("L6", shared_lines["L6"])
+      #  ("L4", shared_lines["L4"]),
+      #  ("L6", shared_lines["L6"])
     ]
     
     mcu1 = MCU("A", lines_controller1, manager)
