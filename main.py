@@ -153,7 +153,7 @@ class MCU:
                         
                     
             elif state == INITIATOR:
-                timeout = perf_counter() + 2.0
+                timeout = perf_counter() + 4.0
                 print(f"[{self.name}] Warte auf SYN_ACK auf {self.current_line}", flush=True)
 
                 while perf_counter() < timeout:
@@ -190,7 +190,7 @@ class MCU:
                 self.last_sent_time.value = perf_counter()
                 self.current_line_obj.release(self.name)
 
-                responding_timeout = perf_counter() + 2.0
+                responding_timeout = perf_counter() + 4.0
                 print(f"[{self.name}] Warte auf ACK auf {self.current_line}", flush=True)
 
                 while perf_counter() < responding_timeout:
