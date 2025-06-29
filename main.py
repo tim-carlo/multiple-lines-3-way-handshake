@@ -53,6 +53,9 @@ class MCU:
         self.received_ack_on = manager.Value('u', '')
         
         
+        self.set_curent_line = manager.Value(c_bool, False)
+        
+        
         
 
     @property
@@ -114,12 +117,33 @@ class MCU:
                     print(f"[{self.name}] Interrupt processed, state is now {self.state.value}", flush=True)
                     continue
                 
+                
+                self.set_curent_line.value = True
                 self.current_line_obj.pull_high(self.name)
                 print(f"[{self.name}] Send SYN on {self.current_line}", flush=True)
-                sleep(SYN_DURATION / 1000.0)
-                self.last_sent_time.value = perf_counter()
-                self.current_line_obj.release(self.name)
-                print(f"[{self.name}] SYN sent on {self.current_line}", flush=True)
+                
+                syn_start = perf_counter()
+                syn_end = syn_start + (SYN_DURATION / 1000.0)
+                
+                while perf_counter() < syn_end:
+                    # Check if any other line is high during SYN transmission
+                    other_active_lines = [name for name, line in self.all_lines.items() 
+                                        if name != self.current_line and line.state() == 1]
+                    if other_active_lines:
+                        # Conflict detected, abort SYN and switch to responder
+                        self.current_line_obj.release(self.name)
+                        self.set_curent_line.value = False
+                        
+                        self.current_line = other_active_lines[0]
+                        print(f"[{self.name}] Conflict detected on {self.current_line}, switching to MAYBE_RESPONDER", flush=True)
+                        self.state.value = MAYBE_RESPONDER
+                        break
+                    sleep(0.0001)
+                else:
+                    # SYN completed successfully
+                    self.last_sent_time.value = perf_counter()
+                    self.current_line_obj.release(self.name)
+                    print(f"[{self.name}] SYN sent on {self.current_line}", flush=True)
                
                 self.state.value = INITIATOR
                 self.role.value = 'initiator'
@@ -158,6 +182,16 @@ class MCU:
 
                 while perf_counter() < timeout:
                     self._process_interrupts()
+                    
+                    # Check if any other line is high during INITIATOR state
+                    other_active_lines = [name for name, line in self.all_lines.items() 
+                                        if name != self.current_line and line.state() == 1]
+                    if other_active_lines:
+                        self.current_line = other_active_lines[0]
+                        print(f"[{self.name}] Other line {self.current_line} is high, switching to MAYBE_RESPONDER", flush=True)
+                        self.state.value = MAYBE_RESPONDER
+                        break
+                    
                     if self.received_syn_ack.value and self.received_syn_ack_on.value == self.current_line:
                         print(f"[{self.name}] SYN_ACK received on {self.current_line}", flush=True)
                         self.received_syn_ack.value = False
@@ -165,10 +199,13 @@ class MCU:
                         
                         
                         # Send ACK
+                        
+                        self.set_curent_line.value = True
                         self.current_line_obj.pull_high(self.name)
                         sleep(ACK_DURATION / 1000.0)
                         self.last_sent_time.value = perf_counter()
                         self.current_line_obj.release(self.name)
+                        self.set_curent_line.value = False
                 
                         self.state.value = SUCCESS
                         print(f"[{self.name}] ACK sent on {self.current_line}", flush=True)
@@ -184,10 +221,13 @@ class MCU:
                 self.last_sent_time.value = perf_counter()
                 
                 print(f"[{self.name}] Send SYN_ACK on {self.current_line}", flush=True)
+                
+                self.set_curent_line.value = True
                 self.current_line_obj.pull_high(self.name)
                 sleep(SYN_ACK_DURATION / 1000.0)
                 self.last_sent_time.value = perf_counter()
                 self.current_line_obj.release(self.name)
+                self.set_curent_line.value = False
 
                 responding_timeout = perf_counter() + 4.0
                 print(f"[{self.name}] Waiting for ACK on {self.current_line}", flush=True)
@@ -209,19 +249,25 @@ class MCU:
 
             elif state == SUCCESS:
                 print(f"[{self.name}] ✅ {self.current_line} works as {self.role.value}", flush=True)
+                if self.current_line not in self.white_list:
+                    self.white_list.append(self.current_line)
+                if self.current_line in self.black_list:
+                    self.black_list.remove(self.current_line)
                 self.successful_lines.append(self.current_line)
-                self.white_list.append(self.current_line)
                 tested.add(self.current_line)
                 self._reset_state()
 
             elif state == FAILED:
                 print(f"[{self.name}] ❌ {self.current_line} failed as {self.role.value}", flush=True)
-                self.black_list.append(self.current_line)
+                if self.current_line not in self.black_list:
+                    self.black_list.append(self.current_line)
+                if self.current_line in self.white_list:
+                    self.white_list.remove(self.current_line)
                 tested.add(self.current_line)
                 self._reset_state()
-                sleep(0.005)
 
         print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
+        print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
 
     def _reset_state(self):
         self.state.value = INIT
@@ -284,15 +330,21 @@ class MCU:
                     durations[name] = None
 
                 self.previous_states[name] = state
-            sleep(0.001)
 
 if __name__ == "__main__":
     set_start_method("fork")
     manager = Manager()
     lines = [("L1", SharedLine(manager)), ("L2", SharedLine(manager)), ("L3", SharedLine(manager))]
+    
+    
+    shared_lines = [SharedLine(manager) for _ in range(5)]
+    linesController1 = [("L1", shared_lines[0]), ("L2", shared_lines[1]), ("L3", shared_lines[2]), ("L5", shared_lines[4])]
+    linesController2 = [("L1", shared_lines[0]), ("L2", shared_lines[1]), ("L3", shared_lines[2]), ("L4", shared_lines[3])]
+    
 
-    mcu1 = MCU("A", lines, manager)
-    mcu2 = MCU("B", lines, manager)
+    mcu1 = MCU("A", linesController1, manager)
+    
+    mcu2 = MCU("B", linesController2, manager)
 
     mcu1.start()
     mcu2.start()
