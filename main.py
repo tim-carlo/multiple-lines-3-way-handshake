@@ -337,14 +337,37 @@ if __name__ == "__main__":
     lines = [("L1", SharedLine(manager)), ("L2", SharedLine(manager)), ("L3", SharedLine(manager))]
     
     
-    shared_lines = [SharedLine(manager) for _ in range(5)]
-    linesController1 = [("L1", shared_lines[0]), ("L2", shared_lines[1]), ("L3", shared_lines[2]), ("L5", shared_lines[4])]
-    linesController2 = [("L1", shared_lines[0]), ("L2", shared_lines[1]), ("L3", shared_lines[2]), ("L4", shared_lines[3])]
+    # Create shared lines
+    shared_lines = {
+        "L1": SharedLine(manager),
+        "L2": SharedLine(manager), 
+        "L3": SharedLine(manager),
+        "L4": SharedLine(manager),
+        "L5": SharedLine(manager),
+        "L6": SharedLine(manager, unreliable=True),  # Unreliable line
+        "L7": SharedLine(manager, one_way=True)      # One-way line
+    }
     
-
-    mcu1 = MCU("A", linesController1, manager)
+    # Define lines for each controller
+    lines_controller1 = [
+        ("L1", shared_lines["L1"]),
+        ("L2", shared_lines["L2"]),
+        ("L3", shared_lines["L3"]),
+        ("L5", shared_lines["L5"]),
+        ("L6", shared_lines["L6"]),
+        ("L7", shared_lines["L7"])
+    ]
     
-    mcu2 = MCU("B", linesController2, manager)
+    lines_controller2 = [
+        ("L1", shared_lines["L1"]),
+        ("L2", shared_lines["L2"]),
+        ("L3", shared_lines["L3"]),
+        ("L4", shared_lines["L4"]),
+        ("L6", shared_lines["L6"])
+    ]
+    
+    mcu1 = MCU("A", lines_controller1, manager)
+    mcu2 = MCU("B", lines_controller2, manager)
 
     mcu1.start()
     mcu2.start()
