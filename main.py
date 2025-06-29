@@ -348,18 +348,18 @@ if __name__ == "__main__":
         ("L1", shared_lines["L1"]),
         ("L2", shared_lines["L2"]),
         ("L3", shared_lines["L3"]),
-       # ("L5", shared_lines["L5"]),
+        ("L5", shared_lines["L5"]),
        # ("L6", shared_lines["L6"]),
-       ("L7", shared_lines["L7"])
+      # ("L7", shared_lines["L7"])
     ]
     
     lines_controller2 = [
         ("L1", shared_lines["L1"]),
         ("L2", shared_lines["L2"]),
         ("L3", shared_lines["L3"]),
-      #  ("L4", shared_lines["L4"]),
+        ("L4", shared_lines["L4"]),
       #  ("L6", shared_lines["L6"]),
-        ("L7", shared_lines["L7"])
+        #("L7", shared_lines["L7"])
     ]
     
     mcu1 = MCU("A", lines_controller1, manager)
@@ -375,7 +375,10 @@ if __name__ == "__main__":
         mcu2.stop()
         mcu1.join()
         mcu2.join()
-        
+    
+    # Log end state for all lines
+    for line in shared_lines.values():
+        line.log_end()
     # Plotting
     plotter = MultiLinePlotter([])
     
@@ -386,7 +389,8 @@ if __name__ == "__main__":
     plotter.add_line(shared_lines["L1"])
     plotter.add_line(shared_lines["L2"])
     plotter.add_line(shared_lines["L3"])
-    plotter.add_line(shared_lines["L7"])
+    plotter.add_line(shared_lines["L4"])
+    plotter.add_line(shared_lines["L5"])
     
     plotter.plot_all()
     

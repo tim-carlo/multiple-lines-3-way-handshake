@@ -24,6 +24,8 @@ class SharedLine:
 
     def state(self):
         return 1 if len(self.holders) > 0 else 0
+    def log_end(self):
+        self._log_state()
 
     def _log_state(self):
         self.data_log.append({
@@ -31,6 +33,7 @@ class SharedLine:
             'state': self.state(),
             'holders_count': len(self.holders)
         })
+    
 
     def get_dataframe(self):
         return pd.DataFrame(list(self.data_log))
@@ -56,6 +59,9 @@ class OneWaySharedLine:
 
     def state(self):
         return self._value.value
+    
+    def log_end(self):
+        self._log_state()
 
     def _log_state(self):
         self.data_log.append({
@@ -90,6 +96,9 @@ class UnreliableSharedLine:
         if random.random() < self.failure_rate:
             return 0
         return 1 if len(self.holders) > 0 else 0
+    
+    def log_end(self):
+        self._log_state()
 
     def _log_state(self):
         actual_state = 1 if len(self.holders) > 0 else 0
