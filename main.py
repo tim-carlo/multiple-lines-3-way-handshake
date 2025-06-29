@@ -2,7 +2,7 @@ from multiprocessing import Process, Event, Queue, Manager, set_start_method
 from time import sleep, perf_counter
 import random
 from ctypes import c_bool
-from shared_lines import SharedLine, OneWaySharedLine, UnreliableSharedLine
+from shared_lines import SharedLine, OneWaySharedLine, UnreliableSharedLine, MultiLinePlotter
 
 # Signal Timings (ms)
 SYN_DURATION = 500
@@ -369,9 +369,24 @@ if __name__ == "__main__":
     mcu2.start()
 
     try:
-        sleep(30)
+        sleep(15)
     finally:
         mcu1.stop()
         mcu2.stop()
         mcu1.join()
         mcu2.join()
+        
+    # Plotting
+    plotter = MultiLinePlotter([])
+    
+    print("Plotting results...")
+    print("L1 DataFrame:")
+    print(shared_lines["L1"].get_dataframe())
+    
+    plotter.add_line(shared_lines["L1"])
+    plotter.add_line(shared_lines["L2"])
+    plotter.add_line(shared_lines["L3"])
+    plotter.add_line(shared_lines["L7"])
+    
+    plotter.plot_all()
+    
