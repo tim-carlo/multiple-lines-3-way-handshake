@@ -55,11 +55,7 @@ class MCU:
         self.received_ack = manager.Value(c_bool, False)
         self.received_ack_on = manager.Value('u', '')
         
-        
         self.set_curent_line = manager.Value(c_bool, False)
-        
-        
-        
 
     @property
     def current_line_obj(self):
@@ -80,6 +76,9 @@ class MCU:
         self.interrupt_event.set()
 
     def _run_logic(self):
+        # TEST: Print initialization
+        print(f"TEST: {self.name} starting logic with {len(self.all_lines)} lines")
+        
         tested = set()
         slot = None
         slot_start = None
@@ -155,13 +154,13 @@ class MCU:
 
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
-                    
+
                     # Check if we received a SYN signal
                     if self.received_syn.value:
-                        print(f"[{self.name}] SYN received on {self.current_line}", flush=True)
+                        self.current_line = self.received_syn_on.value  # Use the line on which SYN was received
+                        print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
                         self.received_syn.value = False
                         self.state.value = RESPONDER
-                        self.received_syn_on.value = self.current_line
                         self.role.value = 'responder'
                         break
                 else:
@@ -287,6 +286,7 @@ class MCU:
             if edge_type == "SYN":
                 print(f"[{self.name}] Received SYN on {line_name}", flush=True)
                 self.received_syn.value = True
+                self.received_syn_on.value = line_name
                 self.current_line = line_name
 
             elif edge_type == "SYN_ACK":
@@ -350,7 +350,7 @@ if __name__ == "__main__":
         ("L3", shared_lines["L3"]),
        # ("L5", shared_lines["L5"]),
        # ("L6", shared_lines["L6"]),
-       # ("L7", shared_lines["L7"])
+       ("L7", shared_lines["L7"])
     ]
     
     lines_controller2 = [
@@ -358,7 +358,8 @@ if __name__ == "__main__":
         ("L2", shared_lines["L2"]),
         ("L3", shared_lines["L3"]),
       #  ("L4", shared_lines["L4"]),
-      #  ("L6", shared_lines["L6"])
+      #  ("L6", shared_lines["L6"]),
+        ("L7", shared_lines["L7"])
     ]
     
     mcu1 = MCU("A", lines_controller1, manager)
