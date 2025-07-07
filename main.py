@@ -30,8 +30,29 @@ TIMEOUT_SYN_ACK = 2.0  # Timeout for initiator to wait for SYN_ACK
 TIMEOUT_ACK = 2.0  # Timeout for responder to wait for ACK
 PASSIVE_RESPONDER_TIMEOUT = 10.0  # Timeout for passive responder mode
 
+DEAD_LINE_PINS = 
 
 
+class PinData:
+    def __init__(self):
+        self.ack = False
+        self.syn_ack = False
+        self.ack = False
+        
+        self.last_signal_time = 0.0
+        
+    def set_ack(self, ack):
+        self.ack = ack
+        self.last_signal_time = perf_counter()
+    def set_syn_ack(self, syn_ack):
+        self.syn_ack = syn_ack
+        self.last_signal_time = perf_counter()
+    def set_ack(self, ack):
+        self.ack = ack
+        self.last_signal_time = perf_counter()
+    def is_dead(self):
+        return perf_counter() - self.last_signal_time > PASSIVE_RESPONDER_TIMEOUT
+    
 
 
 class MCU:
@@ -68,6 +89,8 @@ class MCU:
         
         
         self.last_line = manager.Value('u', '')
+        self.testedPins = manager.dict()
+        
 
     @property
     def current_line_obj(self):
@@ -88,255 +111,13 @@ class MCU:
         self.interrupt_event.set()
 
     def _run_logic(self):
-        # TEST: Print initialization
-        print(f"TEST: {self.name} starting logic with {len(self.all_lines)} lines")
+        random_release_point = 0.0
         
-        tested = set()
-        slot = None
-        slot_start = None
-        timeout = None
-        responding_timeout = None
-        
-        passive_timeout = 0
-
         while True:
             self._process_interrupts()
-            state = self.state.value
-
-            if state == INIT:
-                available = [ln for ln in self.all_lines.keys() if ln not in tested]
-                if not available:
-                    # All pins tested, enter passive responder mode
-                    print(f"[{self.name}] All pins tested, entering PASSIVE_RESPONDER mode", flush=True)
-                    self.state.value = PASSIVE_RESPONDER
-                    continue
-
-                self.current_line = random.choice(available)
-                slot = random.choice(TIME_SLOTS_MS)
-                slot_start = perf_counter()
-                responding_timeout = None
-                print(f"[{self.name}] Time slot: {slot} ms for line {self.current_line}", flush=True)
-
-                while (perf_counter() - slot_start) < slot / 1000.0 and self.state.value == INIT:
-                    #self._process_interrupts()
-                    # Check if any line is active and handle potential conflict
-                    active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
-                    if active_lines:
-                        self.current_line = active_lines[0]  # Take the first active line
-                        print(f"[{self.name}] Line active on {self.current_line}, entering MAYBE_RESPONDER state", flush=True)
-                        self.state.value = MAYBE_RESPONDER
-                        break
-                    sleep(0.0001)
-                    
-
-                if self.state.value != INIT:
-                    print(f"[{self.name}] Interrupt processed, state is now {self.state.value}", flush=True)
-                    continue
-                
-                
-                self.set_curent_line.value = True
-                print(f"[{self.name}] Send SYN on {self.current_line}", flush=True)
-                self.current_line_obj.pull_high(self.name)
-                
-                syn_start = perf_counter()
-                syn_end = syn_start + (SYN_DURATION / 1000.0)
-                
-                confict_detected = False
-                
-                while perf_counter() < syn_end:
-                    # Check if any other line is high during SYN transmission
-                    other_active_lines = [name for name, line in self.all_lines.items() 
-                                        if name != self.current_line and line.state() == 1]
-                    if other_active_lines:
-                        # Conflict detected, abort SYN and switch to responder
-                        self.current_line_obj.release(self.name)
-                        self.set_curent_line.value = False
-                        
-                        self.current_line = other_active_lines[0]
-                        print(f"[{self.name}] Conflict detected on {self.current_line}, switching to MAYBE_RESPONDER", flush=True)
-                        self.state.value = MAYBE_RESPONDER
-                        confict_detected = True
-                        
-                        break
-                if not confict_detected:
-                    # SYN completed successfully
-                    self.last_sent_time.value = perf_counter()
-                    self.current_line_obj.release(self.name)
-                    print(f"[{self.name}] SYN sent on {self.current_line}", flush=True)
+            
+            
     
-                    self.state.value = INITIATOR
-                    self.role.value = 'initiator'
-
-            elif state == PASSIVE_RESPONDER:
-                
-                if perf_counter() > passive_timeout:
-                    print("finishing passive responder")
-                    break
-                self._process_interrupts()
-                
-                # Check if any line is active
-                active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
-                if active_lines:
-                    self.current_line = active_lines[0]
-                    print(f"[{self.name}] Line active on {self.current_line}, entering MAYBE_RESPONDER state", flush=True)
-                    self.state.value = MAYBE_RESPONDER
-                    break
-
-                # Check if we received a SYN signal
-                if self.received_syn.value:
-                    self.current_line = self.received_syn_on.value
-                    print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
-                    self.received_syn.value = False
-                    self.state.value = RESPONDER
-                    self.role.value = 'responder'
-                    break
-                    
-                
-            elif state == MAYBE_RESPONDER:
-                responding_timeout = perf_counter() + TIMEOUT_RESPONDER
-
-                while perf_counter() < responding_timeout:
-                    self._process_interrupts()
-
-                    # Check if we received a SYN signal
-                    if self.received_syn.value:
-                        self.current_line = self.received_syn_on.value  # Use the line on which SYN was received
-                        print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
-                        self.received_syn.value = False
-                        self.state.value = RESPONDER
-                        self.role.value = 'responder'
-                        break
-                else:
-                    print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
-                    self._reset_state()
-                        
-                    
-            elif state == INITIATOR:
-                timeout = perf_counter() + TIMEOUT_SYN_ACK
-                print(f"[{self.name}] Waiting for SYN_ACK on {self.current_line}", flush=True)
-
-                while perf_counter() < timeout:
-                    self._process_interrupts()
-                    
-                    # Check if any other line is high during INITIATOR state
-                    other_active_lines = [name for name, line in self.all_lines.items() 
-                                        if name != self.current_line and line.state() == 1]
-                    if other_active_lines:
-                        self.current_line = other_active_lines[0]
-                        print(f"[{self.name}] Other line {self.current_line} is high, switching to MAYBE_RESPONDER", flush=True)
-                        self.state.value = MAYBE_RESPONDER
-                        break
-                    
-                    if self.received_syn_ack.value and self.received_syn_ack_on.value == self.current_line:
-                        print(f"[{self.name}] SYN_ACK received on {self.current_line}", flush=True)
-                        self.received_syn_ack.value = False
-                        self.received_syn_ack_on.value = ''
-                        
-                        
-                        sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
-                        
-                        # Send ACK
-                        self.set_curent_line.value = True
-                        self.current_line_obj.pull_high(self.name)
-                        sleep(ACK_DURATION / 1000.0)
-                        self.last_sent_time.value = perf_counter()
-                        self.current_line_obj.release(self.name)
-                        self.set_curent_line.value = False
-                
-                        self.state.value = SUCCESS
-                        print(f"[{self.name}] ACK sent on {self.current_line}", flush=True)
-                        break
-                else:
-                    print(f"[{self.name}] Timeout waiting for SYN_ACK on {self.current_line}", flush=True)
-                    self.state.value = FAILED
-                    self.received_syn_ack.value = False
-                    self.received_syn_ack_on.value = ''
-
-            elif state == RESPONDER:
-                self.last_sent_time.value = perf_counter()
-                
-                print(f"[{self.name}] Send SYN_ACK on {self.current_line}", flush=True)
-                
-                self.set_curent_line.value = True
-                self.current_line_obj.pull_high(self.name)
-                sleep(SYN_ACK_DURATION / 1000.0)
-                self.last_sent_time.value = perf_counter()
-                self.current_line_obj.release(self.name)
-                self.set_curent_line.value = False
-                
-                sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
-
-                responding_timeout = perf_counter() + TIMEOUT_ACK
-                print(f"[{self.name}] Waiting for ACK on {self.current_line}", flush=True)
-
-                while perf_counter() < responding_timeout:
-                    self._process_interrupts()
-                    if self.received_ack.value and self.received_ack_on.value == self.current_line:
-                        self.received_ack.value = False
-                        self.received_ack_on.value = ''
-                        print(f"[{self.name}] ACK received on {self.current_line}", flush=True)
-                        self.state.value = SUCCESS
-                        break
-                else:
-                    print(f"[{self.name}] Timeout waiting for ACK on {self.current_line}", flush=True)
-                    self.received_ack.value = False
-                    self.received_ack_on.value = ''
-                    self.state.value = FAILED
-
-            elif state == SUCCESS:
-                print(f"[{self.name}] ✅ {self.current_line} works as {self.role.value}", flush=True)
-                if self.current_line not in self.white_list:
-                    self.white_list.append(self.current_line)
-                if self.current_line in self.black_list:
-                    self.black_list.remove(self.current_line)
-                self.successful_lines.append(self.current_line)
-                tested.add(self.current_line)
-                
-                # After success, check if all pins are tested
-                if len(tested) >= len(self.all_lines):
-                    print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
-                    print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
-                    print(f"[{self.name}] All pins tested after success, entering PASSIVE_RESPONDER", flush=True)
-                    self._reset_state()
-                    
-                    passive_timeout = perf_counter() + PASSIVE_RESPONDER_TIMEOUT
-                    self.state.value = PASSIVE_RESPONDER
-                else:
-                    self._reset_state()
-
-            elif state == FAILED:
-                print(f"[{self.name}] ❌ {self.current_line} failed as {self.role.value}", flush=True)
-                if self.current_line not in self.black_list:
-                    self.black_list.append(self.current_line)
-                if self.current_line in self.white_list:
-                    self.white_list.remove(self.current_line)
-                tested.add(self.current_line)
-                
-                # After failure, check if all pins are tested
-                if len(tested) >= len(self.all_lines):
-                    print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
-                    print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
-                    print(f"[{self.name}] All pins tested after failure, entering PASSIVE_RESPONDER", flush=True)
-                    self._reset_state()
-                    
-                    passive_timeout = perf_counter() + PASSIVE_RESPONDER_TIMEOUT
-                    self.state.value = PASSIVE_RESPONDER
-                else:
-                    self._reset_state()
-
-        
-
-    def _reset_state(self):
-        self.state.value = INIT
-        self.current_line = None
-        self.received_syn_on.value = ''
-        self.received_syn_ack.value = False
-        self.received_ack.value = False
-        self.received_ack_on.value = ''
-        self.received_syn.value = False
-        self.received_syn_ack_on.value = ''
-        self.received_ack_on.value = ''
-        self.last_sent_time.value = 0.0
         
         self.role.value = ''
 
