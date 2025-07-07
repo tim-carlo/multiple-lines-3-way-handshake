@@ -8,9 +8,9 @@ from shared_lines import SharedLine, OneWaySharedLine, UnreliableSharedLine, Mul
 SYN_DURATION = 500
 SYN_ACK_DURATION = 1000
 ACK_DURATION = 1500
-TOLERANCE = 20
+TOLERANCE = 100
 
-LINE_SETTLE_DURATION = 100  # Duration to wait for line to settle after pulling high
+LINE_SETTLE_DURATION = 50  # Duration to wait for line to settle after pulling high
 
 # Time Slots in ms
 TIME_SLOTS_MS = list(range(0, 1000, 10))
@@ -22,6 +22,15 @@ RESPONDER = 2
 SUCCESS = 3
 FAILED = 4
 MAYBE_RESPONDER = 5
+PASSIVE_RESPONDER = 6  # New state for when all pins have been tested
+
+
+TIMEOUT_RESPONDER = 2.0  # Timeout for responder to wait for SYN
+TIMEOUT_SYN_ACK = 2.0  # Timeout for initiator to wait for SYN_ACK
+TIMEOUT_ACK = 2.0  # Timeout for responder to wait for ACK
+PASSIVE_RESPONDER_TIMEOUT = 10.0  # Timeout for passive responder mode
+
+
 
 
 
@@ -56,6 +65,9 @@ class MCU:
         self.received_ack_on = manager.Value('u', '')
         
         self.set_curent_line = manager.Value(c_bool, False)
+        
+        
+        self.last_line = manager.Value('u', '')
 
     @property
     def current_line_obj(self):
@@ -84,15 +96,20 @@ class MCU:
         slot_start = None
         timeout = None
         responding_timeout = None
+        
+        passive_timeout = 0
 
-        while len(tested) < len(self.all_lines):
+        while True:
             self._process_interrupts()
             state = self.state.value
 
             if state == INIT:
                 available = [ln for ln in self.all_lines.keys() if ln not in tested]
                 if not available:
-                    break
+                    # All pins tested, enter passive responder mode
+                    print(f"[{self.name}] All pins tested, entering PASSIVE_RESPONDER mode", flush=True)
+                    self.state.value = PASSIVE_RESPONDER
+                    continue
 
                 self.current_line = random.choice(available)
                 slot = random.choice(TIME_SLOTS_MS)
@@ -101,7 +118,7 @@ class MCU:
                 print(f"[{self.name}] Time slot: {slot} ms for line {self.current_line}", flush=True)
 
                 while (perf_counter() - slot_start) < slot / 1000.0 and self.state.value == INIT:
-                    self._process_interrupts()
+                    #self._process_interrupts()
                     # Check if any line is active and handle potential conflict
                     active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
                     if active_lines:
@@ -111,9 +128,6 @@ class MCU:
                         break
                     sleep(0.0001)
                     
-                    
-                if self.state.value != INIT:
-                    continue
 
                 if self.state.value != INIT:
                     print(f"[{self.name}] Interrupt processed, state is now {self.state.value}", flush=True)
@@ -121,11 +135,13 @@ class MCU:
                 
                 
                 self.set_curent_line.value = True
-                self.current_line_obj.pull_high(self.name)
                 print(f"[{self.name}] Send SYN on {self.current_line}", flush=True)
+                self.current_line_obj.pull_high(self.name)
                 
                 syn_start = perf_counter()
                 syn_end = syn_start + (SYN_DURATION / 1000.0)
+                
+                confict_detected = False
                 
                 while perf_counter() < syn_end:
                     # Check if any other line is high during SYN transmission
@@ -139,18 +155,45 @@ class MCU:
                         self.current_line = other_active_lines[0]
                         print(f"[{self.name}] Conflict detected on {self.current_line}, switching to MAYBE_RESPONDER", flush=True)
                         self.state.value = MAYBE_RESPONDER
+                        confict_detected = True
+                        
                         break
-                else:
+                if not confict_detected:
                     # SYN completed successfully
                     self.last_sent_time.value = perf_counter()
                     self.current_line_obj.release(self.name)
                     print(f"[{self.name}] SYN sent on {self.current_line}", flush=True)
-               
-                self.state.value = INITIATOR
-                self.role.value = 'initiator'
+    
+                    self.state.value = INITIATOR
+                    self.role.value = 'initiator'
+
+            elif state == PASSIVE_RESPONDER:
+                
+                if perf_counter() > passive_timeout:
+                    print("finishing passive responder")
+                    break
+                self._process_interrupts()
+                
+                # Check if any line is active
+                active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
+                if active_lines:
+                    self.current_line = active_lines[0]
+                    print(f"[{self.name}] Line active on {self.current_line}, entering MAYBE_RESPONDER state", flush=True)
+                    self.state.value = MAYBE_RESPONDER
+                    break
+
+                # Check if we received a SYN signal
+                if self.received_syn.value:
+                    self.current_line = self.received_syn_on.value
+                    print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
+                    self.received_syn.value = False
+                    self.state.value = RESPONDER
+                    self.role.value = 'responder'
+                    break
+                    
                 
             elif state == MAYBE_RESPONDER:
-                responding_timeout = perf_counter() + 1.0  # Reduced timeout
+                responding_timeout = perf_counter() + TIMEOUT_RESPONDER
 
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
@@ -164,13 +207,12 @@ class MCU:
                         self.role.value = 'responder'
                         break
                 else:
-                    if not self.stop_event.is_set():
-                        print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
-                        self._reset_state()
+                    print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
+                    self._reset_state()
                         
                     
             elif state == INITIATOR:
-                timeout = perf_counter() + 4.0
+                timeout = perf_counter() + TIMEOUT_SYN_ACK
                 print(f"[{self.name}] Waiting for SYN_ACK on {self.current_line}", flush=True)
 
                 while perf_counter() < timeout:
@@ -224,7 +266,7 @@ class MCU:
                 
                 sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
 
-                responding_timeout = perf_counter() + 4.0
+                responding_timeout = perf_counter() + TIMEOUT_ACK
                 print(f"[{self.name}] Waiting for ACK on {self.current_line}", flush=True)
 
                 while perf_counter() < responding_timeout:
@@ -249,7 +291,18 @@ class MCU:
                     self.black_list.remove(self.current_line)
                 self.successful_lines.append(self.current_line)
                 tested.add(self.current_line)
-                self._reset_state()
+                
+                # After success, check if all pins are tested
+                if len(tested) >= len(self.all_lines):
+                    print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
+                    print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
+                    print(f"[{self.name}] All pins tested after success, entering PASSIVE_RESPONDER", flush=True)
+                    self._reset_state()
+                    
+                    passive_timeout = perf_counter() + PASSIVE_RESPONDER_TIMEOUT
+                    self.state.value = PASSIVE_RESPONDER
+                else:
+                    self._reset_state()
 
             elif state == FAILED:
                 print(f"[{self.name}] ❌ {self.current_line} failed as {self.role.value}", flush=True)
@@ -258,10 +311,20 @@ class MCU:
                 if self.current_line in self.white_list:
                     self.white_list.remove(self.current_line)
                 tested.add(self.current_line)
-                self._reset_state()
+                
+                # After failure, check if all pins are tested
+                if len(tested) >= len(self.all_lines):
+                    print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
+                    print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
+                    print(f"[{self.name}] All pins tested after failure, entering PASSIVE_RESPONDER", flush=True)
+                    self._reset_state()
+                    
+                    passive_timeout = perf_counter() + PASSIVE_RESPONDER_TIMEOUT
+                    self.state.value = PASSIVE_RESPONDER
+                else:
+                    self._reset_state()
 
-        print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
-        print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
+        
 
     def _reset_state(self):
         self.state.value = INIT
@@ -339,7 +402,9 @@ if __name__ == "__main__":
         "L3": SharedLine(manager),
         "L4": SharedLine(manager),
         "L5": SharedLine(manager),
-        "L6": UnreliableSharedLine(manager, failure_rate=0.1),  # Unreliable line
+        "L8": SharedLine(manager),
+        "L9": SharedLine(manager),
+        "L6": SharedLine(manager),  # Unreliable line
         "L7": OneWaySharedLine(manager, sender_name="A")  # One
     }
     
@@ -348,9 +413,10 @@ if __name__ == "__main__":
         ("L1", shared_lines["L1"]),
         ("L2", shared_lines["L2"]),
         ("L3", shared_lines["L3"]),
-        ("L5", shared_lines["L5"]),
-       # ("L6", shared_lines["L6"]),
-      # ("L7", shared_lines["L7"])
+        ("L6", shared_lines["L6"]),
+        ("L9", shared_lines["L9"]),
+        ("L5", shared_lines["L5"]),  # Add L5 to controller 1
+        ("L8", shared_lines["L8"]),  # Add L8 to controller 1
     ]
     
     lines_controller2 = [
@@ -358,8 +424,9 @@ if __name__ == "__main__":
         ("L2", shared_lines["L2"]),
         ("L3", shared_lines["L3"]),
         ("L4", shared_lines["L4"]),
-      #  ("L6", shared_lines["L6"]),
-        #("L7", shared_lines["L7"])
+        ("L6", shared_lines["L6"]),
+        ("L9", shared_lines["L9"]),
+        ("L8", shared_lines["L8"]),  # Add L8 to controller 2
     ]
     
     mcu1 = MCU("A", lines_controller1, manager)
@@ -382,15 +449,11 @@ if __name__ == "__main__":
     # Plotting
     plotter = MultiLinePlotter([])
     
-    print("Plotting results...")
-    print("L1 DataFrame:")
-    print(shared_lines["L1"].get_dataframe())
     
-    plotter.add_line(shared_lines["L1"])
-    plotter.add_line(shared_lines["L2"])
-    plotter.add_line(shared_lines["L3"])
-    plotter.add_line(shared_lines["L4"])
-    plotter.add_line(shared_lines["L5"])
+    #Add all lines to the plotter
+    for name, line in shared_lines.items():
+        plotter.add_line(line)
+    
     
     plotter.plot_all()
     

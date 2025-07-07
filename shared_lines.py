@@ -46,6 +46,8 @@ class OneWaySharedLine:
         self.data_log = manager.list()
         self.name = name
         self.start_time = perf_counter()
+        
+        self._log_state()
 
     def pull_high(self, name):
         if name == self._sender_name:
@@ -81,6 +83,8 @@ class UnreliableSharedLine:
         self.data_log = manager.list()
         self.name = name
         self.start_time = perf_counter()
+        
+        self._log_state()
 
     def pull_high(self, name):
         if name not in self.holders:
