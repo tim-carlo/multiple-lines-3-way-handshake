@@ -10,7 +10,7 @@ SYN_ACK_DURATION = 1000
 ACK_DURATION = 1500
 TOLERANCE = 100
 
-LINE_SETTLE_DURATION = 50  # Duration to wait for line to settle after pulling high
+LINE_SETTLE_DURATION = 100  # Duration to wait for line to settle after pulling high
 
 # Time Slots in ms
 TIME_SLOTS_MS = list(range(0, 1000, 10))
@@ -30,6 +30,24 @@ TIMEOUT_SYN_ACK = 2.0  # Timeout for initiator to wait for SYN_ACK
 TIMEOUT_ACK = 2.0  # Timeout for responder to wait for ACK
 PASSIVE_RESPONDER_TIMEOUT = 10.0  # Timeout for passive responder mode
 
+
+class PinData:
+    def __init__(self):
+        self.ack = False
+        self.syn = False
+        self.syn_ack = False
+        self.role = ''
+        
+    def set_ack(self, value):
+        self.ack = value
+    def set_syn(self, value):
+        self.syn = value
+    def set_syn_ack(self, value):
+        self.syn_ack = value
+    def set_role(self, value):
+        self.role = value
+    def finished(self):
+        return self.role != ''
 
 
 
@@ -194,11 +212,19 @@ class MCU:
                 
             elif state == MAYBE_RESPONDER:
                 responding_timeout = perf_counter() + TIMEOUT_RESPONDER
+                
+                has_seen_signal = False
 
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
 
-                    # Check if we received a SYN signal
+                    # Check if any other line is high during MAYBE_RESPONDER state
+                    if self.current_line and self.current_line_obj and self.current_line_obj.state() == 1:
+                        if not has_seen_signal:
+                            print(f"[{self.name}] Line {self.current_line} is high, waiting for SYN or SYN_ACK", flush=True)
+                            responding_timeout = responding_timeout + (SYN_DURATION + TOLERANCE) / 1000.0
+                            has_seen_signal = True
+            
                     if self.received_syn.value:
                         self.current_line = self.received_syn_on.value  # Use the line on which SYN was received
                         print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
@@ -214,6 +240,8 @@ class MCU:
             elif state == INITIATOR:
                 timeout = perf_counter() + TIMEOUT_SYN_ACK
                 print(f"[{self.name}] Waiting for SYN_ACK on {self.current_line}", flush=True)
+                
+                has_seen_signal = False
 
                 while perf_counter() < timeout:
                     self._process_interrupts()
@@ -226,6 +254,14 @@ class MCU:
                         print(f"[{self.name}] Other line {self.current_line} is high, switching to MAYBE_RESPONDER", flush=True)
                         self.state.value = MAYBE_RESPONDER
                         break
+                    
+                    if self.current_line and self.current_line_obj and self.current_line_obj.state() == 1:
+                        if not has_seen_signal:
+                            print(f"[{self.name}] Line {self.current_line} is high, waiting for SYN_ACK", flush=True)
+                            print(f"[{self.name}] Timeout set to {timeout}", flush=True)
+                            timeout = timeout + (SYN_ACK_DURATION + TOLERANCE) / 1000.0
+                            print(f"[{self.name}] Timeout extended to {timeout}", flush=True)
+                            has_seen_signal = True
                     
                     if self.received_syn_ack.value and self.received_syn_ack_on.value == self.current_line:
                         print(f"[{self.name}] SYN_ACK received on {self.current_line}", flush=True)
@@ -255,7 +291,7 @@ class MCU:
             elif state == RESPONDER:
                 self.last_sent_time.value = perf_counter()
                 
-                print(f"[{self.name}] Send SYN_ACK on {self.current_line}", flush=True)
+               
                 
                 self.set_curent_line.value = True
                 self.current_line_obj.pull_high(self.name)
@@ -263,14 +299,25 @@ class MCU:
                 self.last_sent_time.value = perf_counter()
                 self.current_line_obj.release(self.name)
                 self.set_curent_line.value = False
+                print(f"[{self.name}] Send SYN_ACK on {self.current_line}", flush=True)
                 
                 sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
 
                 responding_timeout = perf_counter() + TIMEOUT_ACK
                 print(f"[{self.name}] Waiting for ACK on {self.current_line}", flush=True)
+                
+                has_seen_signal = False
 
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
+                    
+                    
+                    # Check if the current line is still high
+                    if self.current_line and self.current_line_obj and self.current_line_obj.state() == 1:
+                        if not has_seen_signal:
+                            print(f"[{self.name}] Line {self.current_line} is high, waiting for ACK", flush=True)
+                            responding_timeout = responding_timeout + (ACK_DURATION + TOLERANCE) / 1000.0
+                            has_seen_signal = True
                     if self.received_ack.value and self.received_ack_on.value == self.current_line:
                         self.received_ack.value = False
                         self.received_ack_on.value = ''
@@ -402,31 +449,23 @@ if __name__ == "__main__":
         "L3": SharedLine(manager),
         "L4": SharedLine(manager),
         "L5": SharedLine(manager),
-        "L8": SharedLine(manager),
-        "L9": SharedLine(manager),
-        "L6": SharedLine(manager),  # Unreliable line
-        "L7": OneWaySharedLine(manager, sender_name="A")  # One
     }
     
     # Define lines for each controller
     lines_controller1 = [
-        ("L1", shared_lines["L1"]),
-        ("L2", shared_lines["L2"]),
-        ("L3", shared_lines["L3"]),
-        ("L6", shared_lines["L6"]),
-        ("L9", shared_lines["L9"]),
-        ("L5", shared_lines["L5"]),  # Add L5 to controller 1
-        ("L8", shared_lines["L8"]),  # Add L8 to controller 1
+      ("L1", shared_lines["L1"]),
+      ("L2", shared_lines["L2"]),
+      ("L3", shared_lines["L3"]),
+      ("L4", shared_lines["L4"]),
+      ("L5", shared_lines["L5"]), 
     ]
     
     lines_controller2 = [
-        ("L1", shared_lines["L1"]),
-        ("L2", shared_lines["L2"]),
-        ("L3", shared_lines["L3"]),
-        ("L4", shared_lines["L4"]),
-        ("L6", shared_lines["L6"]),
-        ("L9", shared_lines["L9"]),
-        ("L8", shared_lines["L8"]),  # Add L8 to controller 2
+      ("L1", shared_lines["L1"]),
+      ("L2", shared_lines["L2"]),
+      ("L3", shared_lines["L3"]),
+      ("L4", shared_lines["L4"]),
+      ("L5", shared_lines["L5"]), 
     ]
     
     mcu1 = MCU("A", lines_controller1, manager)
