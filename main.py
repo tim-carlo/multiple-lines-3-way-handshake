@@ -451,6 +451,7 @@ if __name__ == "__main__":
         "L5": SharedLine(manager),
     }
     
+    
     # Define lines for each controller
     lines_controller1 = [
       ("L1", shared_lines["L1"]),
