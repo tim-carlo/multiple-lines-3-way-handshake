@@ -10,7 +10,7 @@ SYN_ACK_DURATION = 1000
 ACK_DURATION = 1500
 TOLERANCE = 100
 
-LINE_SETTLE_DURATION = 100  # Duration to wait for line to settle after pulling high
+LINE_SETTLE_DURATION = 50  # Duration to wait for line to settle after pulling high
 
 # Time Slots in ms
 TIME_SLOTS_MS = list(range(0, 1000, 10))
@@ -84,8 +84,6 @@ class MCU:
         
         self.set_curent_line = manager.Value(c_bool, False)
         
-        
-        self.last_line = manager.Value('u', '')
 
     @property
     def current_line_obj(self):
@@ -106,7 +104,6 @@ class MCU:
         self.interrupt_event.set()
 
     def _run_logic(self):
-        # TEST: Print initialization
         print(f"TEST: {self.name} starting logic with {len(self.all_lines)} lines")
         
         tested = set()
@@ -421,6 +418,7 @@ class MCU:
                     durations[name] = perf_counter()
                 elif prev == 1 and state == 0 and durations[name] is not None:
                     duration = (perf_counter() - durations[name]) * 1000
+                    print(f"[{self.name}] Line {name} pulled low after {duration:.2f} ms", flush=True)
                     if abs(duration - SYN_DURATION) < TOLERANCE:
                         etype = "SYN"
                     elif abs(duration - SYN_ACK_DURATION) < TOLERANCE:
@@ -449,25 +447,97 @@ if __name__ == "__main__":
         "L3": SharedLine(manager),
         "L4": SharedLine(manager),
         "L5": SharedLine(manager),
+        "L6": SharedLine(manager),
+        "L7": SharedLine(manager),
+        "L8": SharedLine(manager),
+        "L9": SharedLine(manager),
+        "L10": SharedLine(manager),
     }
     
     
-    # Define lines for each controller
+    # Define lines for each controller - various connectivity scenarios
+    
+    # Scenario 1: Partially overlapping lines (current scenario)
+    # lines_controller1 = [
+    #   ("L1", shared_lines["L1"]),
+    #   ("L2", shared_lines["L2"]),
+    #   ("L3", shared_lines["L3"]),
+    #   ("L4", shared_lines["L4"]),
+    #   ("L5", shared_lines["L5"]),
+    #   ("L6", shared_lines["L6"]),
+    # ]
+    
+    # lines_controller2 = [
+    #   ("L1", shared_lines["L1"]),
+    #   ("L2", shared_lines["L2"]),
+    #   ("L3", shared_lines["L3"]),
+    #   ("L4", shared_lines["L4"]),
+    #   ("L5", shared_lines["L5"]), 
+    #   ("L7", shared_lines["L7"]),
+    # ]
+    
+    # Scenario 2: Completely separate lines (no overlap)
+    # lines_controller1 = [
+    #   ("L1", shared_lines["L1"]),
+    #   ("L2", shared_lines["L2"]),
+    #   ("L3", shared_lines["L3"]),
+    #   ("L4", shared_lines["L4"]),
+    #   ("L5", shared_lines["L5"]),
+    # ]
+    
+    # lines_controller2 = [
+    #   ("L6", shared_lines["L6"]),
+    #   ("L7", shared_lines["L7"]),
+    #   ("L8", shared_lines["L8"]),
+    #   ("L9", shared_lines["L9"]),
+    #   ("L10", shared_lines["L10"]),
+    # ]
+    
+    # Scenario 3: Single shared line
+    # lines_controller1 = [
+    #   ("L1", shared_lines["L1"]),
+    #   ("L2", shared_lines["L2"]),
+    #   ("L3", shared_lines["L3"]),
+    # ]
+    
+    # lines_controller2 = [
+    #   ("L1", shared_lines["L1"]),
+    #   ("L4", shared_lines["L4"]),
+    #   ("L5", shared_lines["L5"]),
+    # ]
+    
+    # Scenario 4: Asymmetric connection (one controller has more lines)
+    # lines_controller1 = [
+    #   ("L1", shared_lines["L1"]),
+    #   ("L2", shared_lines["L2"]),
+    #   ("L3", shared_lines["L3"]),
+    #   ("L4", shared_lines["L4"]),
+    #   ("L5", shared_lines["L5"]),
+    #   ("L6", shared_lines["L6"]),
+    #   ("L7", shared_lines["L7"]),
+    #   ("L8", shared_lines["L8"]),
+    # ]
+    
+    # lines_controller2 = [
+    #   ("L1", shared_lines["L1"]),
+    #   ("L3", shared_lines["L3"]),
+    #   ("L5", shared_lines["L5"]),
+    # ]
+    
+    # Scenario 5: Cross-wired connections
     lines_controller1 = [
       ("L1", shared_lines["L1"]),
-      ("L2", shared_lines["L2"]),
-      ("L3", shared_lines["L3"]),
+      ("L2", shared_lines["L3"]),  # Cross-wired
+      ("L3", shared_lines["L2"]),  # Cross-wired
       ("L4", shared_lines["L4"]),
-      ("L5", shared_lines["L5"]), 
     ]
     
     lines_controller2 = [
       ("L1", shared_lines["L1"]),
       ("L2", shared_lines["L2"]),
       ("L3", shared_lines["L3"]),
-      ("L4", shared_lines["L4"]),
-      ("L5", shared_lines["L5"]), 
-    ]
+      ("L4", shared_lines["L5"]),  # Different line
+     ]
     
     mcu1 = MCU("A", lines_controller1, manager)
     mcu2 = MCU("B", lines_controller2, manager)
