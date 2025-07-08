@@ -476,7 +476,7 @@ if __name__ == "__main__":
     mcu2.start()
 
     try:
-        sleep(15)
+        sleep(20)
     finally:
         mcu1.stop()
         mcu2.stop()
