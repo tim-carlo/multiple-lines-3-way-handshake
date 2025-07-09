@@ -32,7 +32,8 @@ MAXIMUM_NUMBER_OF_FALSE_RESPONSES = 3  # Maximum number of false responses befor
 
 
 class PinData:
-    def __init__(self, name):
+    def __init__(self, name, line=None):
+        self.line = line  # Reference to the shared line object, if needed
         self.ack = False
         self.syn = False
         self.syn_ack = False
@@ -76,8 +77,22 @@ class PinData:
             'ack': self.ack,
             'syn': self.syn,
             'syn_ack': self.syn_ack,
-            'role': self.role
+            'role': self.role,
+            'num_false_responses': self.num_false_responses,
+            'blacklisted': self.blacklisted
         }
+    
+    def __eq__(self, other):
+        if not isinstance(other, PinData):
+            return False
+        return (self.name == other.name and 
+                self.ack == other.ack and 
+                self.syn == other.syn and 
+                self.syn_ack == other.syn_ack and 
+                self.role == other.role and 
+                self.num_false_responses == other.num_false_responses and 
+                self.blacklisted == other.blacklisted)
+
 
 class MCU:
     def __init__(self, name, line_names, manager, output_queue=None):
@@ -97,7 +112,7 @@ class MCU:
         
         self.all_lines = {ln: obj for ln, obj in line_names}
         
-        self.pin_data = {name: PinData(name) for name, _ in line_names}
+        self.pin_data = {name: PinData(name, line) for name, line in self.all_lines.items()}
 
         self.current_line = None
         self.state = manager.Value('i', INIT)
@@ -159,12 +174,12 @@ class MCU:
         responding_timeout = None
     
 
-        while len(tested) < len(self.pin_data):
+        while not all(self.pin_data[name].is_tested() for name in self.pin_data):
             self._process_interrupts()
             state = self.state.value
 
             if state == INIT:
-                available = [ln for ln in self.all_lines.keys() if ln not in tested]
+                available = [ln for ln in self.all_lines.keys() if not self.pin_data[ln].is_tested()]
                 
                 self.current_line = random.choice(available)
                 slot = random.choice(TIME_SLOTS_MS)
@@ -178,6 +193,8 @@ class MCU:
                     active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
                     
                     if active_lines:
+                        #TODO: How to handle multiple active lines?
+    
                         self.current_line = active_lines[0]
                         print(f"[{self.name}] Line active on {self.current_line}, entering MAYBE_RESPONDER state", flush=True)
                         self.state.value = MAYBE_RESPONDER
@@ -190,7 +207,9 @@ class MCU:
                 
                 self.set_curent_line.value = True
                 print(f"[{self.name}] Send SYN on {self.current_line}", flush=True)
-                pin_data[self.current_line].set_syn(True)
+                self.pin_data[self.current_line].set_syn(True)
+                 
+                self.pin_data[self.current_line].set_role('initiator')
                 self.current_line_obj.pull_high(self.name)
                 
                 syn_start = perf_counter()
@@ -219,7 +238,7 @@ class MCU:
     
                     self.state.value = INITIATOR
                     self.role.value = 'initiator'
-                    pin_data[self.current_line].set_role('initiator')
+                    self.pin_data[self.current_line].set_role('initiator')
                 
             elif state == MAYBE_RESPONDER:
                 responding_timeout = perf_counter() + TIMEOUT_RESPONDER
@@ -235,7 +254,7 @@ class MCU:
                         self.received_syn.value = False
                         self.state.value = RESPONDER
                         self.role.value = 'responder'
-                        pin_data[self.current_line].set_role('responder')
+                        self.pin_data[self.current_line].set_role('responder')
                         break
                 else:
                     print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
@@ -265,7 +284,7 @@ class MCU:
                     
                     if self.received_syn_ack.value and self.received_syn_ack_on.value == self.current_line:
                         print(f"[{self.name}] SYN_ACK received on {self.current_line}", flush=True)
-                        pin_data[self.current_line].set_syn_ack(True)
+                        self.pin_data[self.current_line].set_syn_ack(True)
                         self.received_syn_ack.value = False
                         self.received_syn_ack_on.value = ''
                         
@@ -274,7 +293,7 @@ class MCU:
                         self.set_curent_line.value = True
                         self.current_line_obj.pull_high(self.name)
                         sleep(ACK_DURATION / 1000.0)
-                        pin_data[self.current_line].set_ack(True)
+                        self.pin_data[self.current_line].set_ack(True)
                         self.last_sent_time.value = perf_counter()
                         self.current_line_obj.release(self.name)
                         self.set_curent_line.value = False
@@ -294,7 +313,7 @@ class MCU:
                 self.set_curent_line.value = True
                 self.current_line_obj.pull_high(self.name)
                 sleep(SYN_ACK_DURATION / 1000.0)
-                pin_data[self.current_line].set_syn_ack(True)
+                self.pin_data[self.current_line].set_syn_ack(True)
                 self.last_sent_time.value = perf_counter()
                 self.current_line_obj.release(self.name)
                 self.set_curent_line.value = False
@@ -303,6 +322,7 @@ class MCU:
                 sleep(LINE_SETTLE_DURATION / 1000.0)
 
                 responding_timeout = perf_counter() + TIMEOUT_ACK
+                
                 print(f"[{self.name}] Waiting for ACK on {self.current_line}", flush=True)
                 has_seen_signal = False
 
@@ -316,7 +336,7 @@ class MCU:
                             has_seen_signal = True
                             
                     if self.received_ack.value and self.received_ack_on.value == self.current_line:
-                        pin_data[self.current_line].set_ack(True)
+                        self.pin_data[self.current_line].set_ack(True)
                         self.received_ack.value = False
                         self.received_ack_on.value = ''
                         print(f"[{self.name}] ACK received on {self.current_line}", flush=True)
@@ -330,24 +350,13 @@ class MCU:
 
             elif state == SUCCESS:
                 print(f"[{self.name}] ✅ {self.current_line} works as {self.role.value}", flush=True)
-                if self.current_line not in self.white_list:
-                    self.white_list.append(self.current_line)
-                if self.current_line in self.black_list:
-                    self.black_list.remove(self.current_line)
-                self.successful_lines.append(self.current_line)
-                tested.add(self.current_line)
-                
+                self.pin_data[self.current_line].set_role(self.role.value)
                 
                 self._reset_state()
 
             elif state == FAILED:
                 print(f"[{self.name}] ❌ {self.current_line} failed as {self.role.value}", flush=True)
-                if self.current_line not in self.black_list:
-                    self.black_list.append(self.current_line)
-                if self.current_line in self.white_list:
-                    self.white_list.remove(self.current_line)
-                tested.add(self.current_line)
-                
+                self.pin_data[self.current_line].set_blacklisted(True)
                 
                 self._reset_state()
 
