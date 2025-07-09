@@ -4,6 +4,8 @@ import random
 from ctypes import c_bool
 from shared_lines import SharedLine, OneWaySharedLine, UnreliableSharedLine, MultiLinePlotter
 
+from hypothesis import given, strategies as st
+
 # Signal Timings (ms)
 SYN_DURATION = 500
 SYN_ACK_DURATION = 1000
@@ -194,11 +196,6 @@ class MCU:
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
 
-                    if self.current_line and self.current_line_obj and self.current_line_obj.state() == 1:
-                        if not has_seen_signal:
-                            print(f"[{self.name}] Line {self.current_line} is high, waiting for SYN or SYN_ACK", flush=True)
-                            responding_timeout = perf_counter() + (SYN_DURATION + TOLERANCE) / 1000.0
-                            has_seen_signal = True
             
                     if self.received_syn.value:
                         self.current_line = self.received_syn_on.value
