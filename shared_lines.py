@@ -39,6 +39,8 @@ class SharedLine:
         return pd.DataFrame(list(self.data_log))
 
 
+
+
 class OneWaySharedLine:
     def __init__(self, manager, sender_name, name="OneWaySharedLine"):
         self._value = manager.Value('i', 0)
