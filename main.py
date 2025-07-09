@@ -22,21 +22,18 @@ RESPONDER = 2
 SUCCESS = 3
 FAILED = 4
 MAYBE_RESPONDER = 5
-PASSIVE_RESPONDER = 6  # New state for when all pins have been tested
-
 
 TIMEOUT_RESPONDER = 2.0  # Timeout for responder to wait for SYN
 TIMEOUT_SYN_ACK = 2.0  # Timeout for initiator to wait for SYN_ACK
 TIMEOUT_ACK = 2.0  # Timeout for responder to wait for ACK
-PASSIVE_RESPONDER_TIMEOUT = 10.0  # Timeout for passive responder mode
-
 
 class PinData:
-    def __init__(self):
+    def __init__(self, name):
         self.ack = False
         self.syn = False
         self.syn_ack = False
         self.role = ''
+        self.name = name
         
     def set_ack(self, value):
         self.ack = value
@@ -48,17 +45,24 @@ class PinData:
         self.role = value
     def finished(self):
         return self.role != ''
-
-
-
+    
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'ack': self.ack,
+            'syn': self.syn,
+            'syn_ack': self.syn_ack,
+            'role': self.role
+        }
 
 class MCU:
-    def __init__(self, name, line_names, manager):
+    def __init__(self, name, line_names, manager, output_queue=None):
         self.name = name
         self.manager = manager
         self.interrupt_queue = Queue()
         self.interrupt_event = Event()
         self.stop_event = Event()
+        self.output_queue = output_queue  # Queue to send data to main process
 
         self.white_list = manager.list()
         self.black_list = manager.list()
@@ -83,7 +87,17 @@ class MCU:
         self.received_ack_on = manager.Value('u', '')
         
         self.set_curent_line = manager.Value(c_bool, False)
-        
+
+    def _send_pin_data_to_main(self, pin_data, status):
+        """Send pin data to main process via output queue"""
+        if self.output_queue:
+            data = {
+                'mcu_name': self.name,
+                'pin_data': pin_data.to_dict(),
+                'status': status,
+                'timestamp': perf_counter()
+            }
+            self.output_queue.put(data)
 
     @property
     def current_line_obj(self):
@@ -107,6 +121,7 @@ class MCU:
         print(f"TEST: {self.name} starting logic with {len(self.all_lines)} lines")
         
         tested = set()
+        pin_data = {name: PinData(name) for name in self.all_lines.keys()}
         slot = None
         slot_start = None
         timeout = None
@@ -114,18 +129,13 @@ class MCU:
         
         passive_timeout = 0
 
-        while True:
+        while len(tested) < len(self.all_lines):
             self._process_interrupts()
             state = self.state.value
 
             if state == INIT:
                 available = [ln for ln in self.all_lines.keys() if ln not in tested]
-                if not available:
-                    # All pins tested, enter passive responder mode
-                    print(f"[{self.name}] All pins tested, entering PASSIVE_RESPONDER mode", flush=True)
-                    self.state.value = PASSIVE_RESPONDER
-                    continue
-
+                
                 self.current_line = random.choice(available)
                 slot = random.choice(TIME_SLOTS_MS)
                 slot_start = perf_counter()
@@ -133,24 +143,21 @@ class MCU:
                 print(f"[{self.name}] Time slot: {slot} ms for line {self.current_line}", flush=True)
 
                 while (perf_counter() - slot_start) < slot / 1000.0 and self.state.value == INIT:
-                    #self._process_interrupts()
-                    # Check if any line is active and handle potential conflict
                     active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
                     if active_lines:
-                        self.current_line = active_lines[0]  # Take the first active line
+                        self.current_line = active_lines[0]
                         print(f"[{self.name}] Line active on {self.current_line}, entering MAYBE_RESPONDER state", flush=True)
                         self.state.value = MAYBE_RESPONDER
                         break
                     sleep(0.0001)
-                    
 
                 if self.state.value != INIT:
                     print(f"[{self.name}] Interrupt processed, state is now {self.state.value}", flush=True)
                     continue
                 
-                
                 self.set_curent_line.value = True
                 print(f"[{self.name}] Send SYN on {self.current_line}", flush=True)
+                pin_data[self.current_line].set_syn(True)
                 self.current_line_obj.pull_high(self.name)
                 
                 syn_start = perf_counter()
@@ -159,11 +166,9 @@ class MCU:
                 confict_detected = False
                 
                 while perf_counter() < syn_end:
-                    # Check if any other line is high during SYN transmission
                     other_active_lines = [name for name, line in self.all_lines.items() 
                                         if name != self.current_line and line.state() == 1]
                     if other_active_lines:
-                        # Conflict detected, abort SYN and switch to responder
                         self.current_line_obj.release(self.name)
                         self.set_curent_line.value = False
                         
@@ -171,79 +176,50 @@ class MCU:
                         print(f"[{self.name}] Conflict detected on {self.current_line}, switching to MAYBE_RESPONDER", flush=True)
                         self.state.value = MAYBE_RESPONDER
                         confict_detected = True
-                        
                         break
+                        
                 if not confict_detected:
-                    # SYN completed successfully
                     self.last_sent_time.value = perf_counter()
                     self.current_line_obj.release(self.name)
                     print(f"[{self.name}] SYN sent on {self.current_line}", flush=True)
     
                     self.state.value = INITIATOR
                     self.role.value = 'initiator'
-
-            elif state == PASSIVE_RESPONDER:
-                
-                if perf_counter() > passive_timeout:
-                    print("finishing passive responder")
-                    break
-                self._process_interrupts()
-                
-                # Check if any line is active
-                active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
-                if active_lines:
-                    self.current_line = active_lines[0]
-                    print(f"[{self.name}] Line active on {self.current_line}, entering MAYBE_RESPONDER state", flush=True)
-                    self.state.value = MAYBE_RESPONDER
-                    break
-
-                # Check if we received a SYN signal
-                if self.received_syn.value:
-                    self.current_line = self.received_syn_on.value
-                    print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
-                    self.received_syn.value = False
-                    self.state.value = RESPONDER
-                    self.role.value = 'responder'
-                    break
-                    
+                    pin_data[self.current_line].set_role('initiator')
                 
             elif state == MAYBE_RESPONDER:
                 responding_timeout = perf_counter() + TIMEOUT_RESPONDER
-                
                 has_seen_signal = False
 
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
 
-                    # Check if any other line is high during MAYBE_RESPONDER state
                     if self.current_line and self.current_line_obj and self.current_line_obj.state() == 1:
                         if not has_seen_signal:
                             print(f"[{self.name}] Line {self.current_line} is high, waiting for SYN or SYN_ACK", flush=True)
-                            responding_timeout = responding_timeout + (SYN_DURATION + TOLERANCE) / 1000.0
+                            responding_timeout = perf_counter() + (SYN_DURATION + TOLERANCE) / 1000.0
                             has_seen_signal = True
             
                     if self.received_syn.value:
-                        self.current_line = self.received_syn_on.value  # Use the line on which SYN was received
+                        self.current_line = self.received_syn_on.value
                         print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
                         self.received_syn.value = False
                         self.state.value = RESPONDER
                         self.role.value = 'responder'
+                        pin_data[self.current_line].set_role('responder')
                         break
                 else:
                     print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
                     self._reset_state()
                         
-                    
             elif state == INITIATOR:
                 timeout = perf_counter() + TIMEOUT_SYN_ACK
                 print(f"[{self.name}] Waiting for SYN_ACK on {self.current_line}", flush=True)
-                
                 has_seen_signal = False
 
                 while perf_counter() < timeout:
                     self._process_interrupts()
                     
-                    # Check if any other line is high during INITIATOR state
                     other_active_lines = [name for name, line in self.all_lines.items() 
                                         if name != self.current_line and line.state() == 1]
                     if other_active_lines:
@@ -255,23 +231,21 @@ class MCU:
                     if self.current_line and self.current_line_obj and self.current_line_obj.state() == 1:
                         if not has_seen_signal:
                             print(f"[{self.name}] Line {self.current_line} is high, waiting for SYN_ACK", flush=True)
-                            print(f"[{self.name}] Timeout set to {timeout}", flush=True)
-                            timeout = timeout + (SYN_ACK_DURATION + TOLERANCE) / 1000.0
-                            print(f"[{self.name}] Timeout extended to {timeout}", flush=True)
+                            timeout = perf_counter() + (SYN_ACK_DURATION + TOLERANCE) / 1000.0
                             has_seen_signal = True
                     
                     if self.received_syn_ack.value and self.received_syn_ack_on.value == self.current_line:
                         print(f"[{self.name}] SYN_ACK received on {self.current_line}", flush=True)
+                        pin_data[self.current_line].set_syn_ack(True)
                         self.received_syn_ack.value = False
                         self.received_syn_ack_on.value = ''
                         
+                        sleep(LINE_SETTLE_DURATION / 1000.0)
                         
-                        sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
-                        
-                        # Send ACK
                         self.set_curent_line.value = True
                         self.current_line_obj.pull_high(self.name)
                         sleep(ACK_DURATION / 1000.0)
+                        pin_data[self.current_line].set_ack(True)
                         self.last_sent_time.value = perf_counter()
                         self.current_line_obj.release(self.name)
                         self.set_curent_line.value = False
@@ -288,34 +262,32 @@ class MCU:
             elif state == RESPONDER:
                 self.last_sent_time.value = perf_counter()
                 
-               
-                
                 self.set_curent_line.value = True
                 self.current_line_obj.pull_high(self.name)
                 sleep(SYN_ACK_DURATION / 1000.0)
+                pin_data[self.current_line].set_syn_ack(True)
                 self.last_sent_time.value = perf_counter()
                 self.current_line_obj.release(self.name)
                 self.set_curent_line.value = False
                 print(f"[{self.name}] Send SYN_ACK on {self.current_line}", flush=True)
                 
-                sleep(LINE_SETTLE_DURATION / 1000.0)  # Wait for line to settle
+                sleep(LINE_SETTLE_DURATION / 1000.0)
 
                 responding_timeout = perf_counter() + TIMEOUT_ACK
                 print(f"[{self.name}] Waiting for ACK on {self.current_line}", flush=True)
-                
                 has_seen_signal = False
 
                 while perf_counter() < responding_timeout:
                     self._process_interrupts()
                     
-                    
-                    # Check if the current line is still high
                     if self.current_line and self.current_line_obj and self.current_line_obj.state() == 1:
                         if not has_seen_signal:
                             print(f"[{self.name}] Line {self.current_line} is high, waiting for ACK", flush=True)
-                            responding_timeout = responding_timeout + (ACK_DURATION + TOLERANCE) / 1000.0
+                            responding_timeout = perf_counter() + (ACK_DURATION + TOLERANCE) / 1000.0
                             has_seen_signal = True
+                            
                     if self.received_ack.value and self.received_ack_on.value == self.current_line:
+                        pin_data[self.current_line].set_ack(True)
                         self.received_ack.value = False
                         self.received_ack_on.value = ''
                         print(f"[{self.name}] ACK received on {self.current_line}", flush=True)
@@ -336,17 +308,8 @@ class MCU:
                 self.successful_lines.append(self.current_line)
                 tested.add(self.current_line)
                 
-                # After success, check if all pins are tested
-                if len(tested) >= len(self.all_lines):
-                    print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
-                    print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
-                    print(f"[{self.name}] All pins tested after success, entering PASSIVE_RESPONDER", flush=True)
-                    self._reset_state()
-                    
-                    passive_timeout = perf_counter() + PASSIVE_RESPONDER_TIMEOUT
-                    self.state.value = PASSIVE_RESPONDER
-                else:
-                    self._reset_state()
+                
+                self._reset_state()
 
             elif state == FAILED:
                 print(f"[{self.name}] ❌ {self.current_line} failed as {self.role.value}", flush=True)
@@ -356,19 +319,20 @@ class MCU:
                     self.white_list.remove(self.current_line)
                 tested.add(self.current_line)
                 
-                # After failure, check if all pins are tested
-                if len(tested) >= len(self.all_lines):
-                    print(f"[{self.name}] Successful lines: {list(self.successful_lines)}", flush=True)
-                    print(f"[{self.name}] Blacklisted lines: {list(self.black_list)}", flush=True)
-                    print(f"[{self.name}] All pins tested after failure, entering PASSIVE_RESPONDER", flush=True)
-                    self._reset_state()
-                    
-                    passive_timeout = perf_counter() + PASSIVE_RESPONDER_TIMEOUT
-                    self.state.value = PASSIVE_RESPONDER
-                else:
-                    self._reset_state()
+                
+                self._reset_state()
 
-        
+        # Send completion signal
+        if self.output_queue:
+            self.output_queue.put({
+                'mcu_name': self.name,
+                'status': 'COMPLETED',
+                'timestamp': perf_counter(),
+                'role': self.role.value,
+                'white_list': list(self.white_list),
+                'black_list': list(self.black_list),
+                
+            })
 
     def _reset_state(self):
         self.state.value = INIT
@@ -381,7 +345,6 @@ class MCU:
         self.received_syn_ack_on.value = ''
         self.received_ack_on.value = ''
         self.last_sent_time.value = 0.0
-        
         self.role.value = ''
 
     def _process_interrupts(self):
@@ -437,8 +400,9 @@ class MCU:
 if __name__ == "__main__":
     set_start_method("fork")
     manager = Manager()
-    lines = [("L1", SharedLine(manager)), ("L2", SharedLine(manager)), ("L3", SharedLine(manager))]
     
+    # Create output queue for collecting MCU data
+    output_queue = Queue()
     
     # Create shared lines
     shared_lines = {
@@ -454,116 +418,87 @@ if __name__ == "__main__":
         "L10": SharedLine(manager),
     }
     
-    
-    # Define lines for each controller - various connectivity scenarios
-    
-    # Scenario 1: Partially overlapping lines (current scenario)
-    # lines_controller1 = [
-    #   ("L1", shared_lines["L1"]),
-    #   ("L2", shared_lines["L2"]),
-    #   ("L3", shared_lines["L3"]),
-    #   ("L4", shared_lines["L4"]),
-    #   ("L5", shared_lines["L5"]),
-    #   ("L6", shared_lines["L6"]),
-    # ]
-    
-    # lines_controller2 = [
-    #   ("L1", shared_lines["L1"]),
-    #   ("L2", shared_lines["L2"]),
-    #   ("L3", shared_lines["L3"]),
-    #   ("L4", shared_lines["L4"]),
-    #   ("L5", shared_lines["L5"]), 
-    #   ("L7", shared_lines["L7"]),
-    # ]
-    
-    # Scenario 2: Completely separate lines (no overlap)
-    # lines_controller1 = [
-    #   ("L1", shared_lines["L1"]),
-    #   ("L2", shared_lines["L2"]),
-    #   ("L3", shared_lines["L3"]),
-    #   ("L4", shared_lines["L4"]),
-    #   ("L5", shared_lines["L5"]),
-    # ]
-    
-    # lines_controller2 = [
-    #   ("L6", shared_lines["L6"]),
-    #   ("L7", shared_lines["L7"]),
-    #   ("L8", shared_lines["L8"]),
-    #   ("L9", shared_lines["L9"]),
-    #   ("L10", shared_lines["L10"]),
-    # ]
-    
-    # Scenario 3: Single shared line
-    # lines_controller1 = [
-    #   ("L1", shared_lines["L1"]),
-    #   ("L2", shared_lines["L2"]),
-    #   ("L3", shared_lines["L3"]),
-    # ]
-    
-    # lines_controller2 = [
-    #   ("L1", shared_lines["L1"]),
-    #   ("L4", shared_lines["L4"]),
-    #   ("L5", shared_lines["L5"]),
-    # ]
-    
     # Scenario 4: Asymmetric connection (one controller has more lines)
-    # lines_controller1 = [
-    #   ("L1", shared_lines["L1"]),
-    #   ("L2", shared_lines["L2"]),
-    #   ("L3", shared_lines["L3"]),
-    #   ("L4", shared_lines["L4"]),
-    #   ("L5", shared_lines["L5"]),
-    #   ("L6", shared_lines["L6"]),
-    #   ("L7", shared_lines["L7"]),
-    #   ("L8", shared_lines["L8"]),
-    # ]
-    
-    # lines_controller2 = [
-    #   ("L1", shared_lines["L1"]),
-    #   ("L3", shared_lines["L3"]),
-    #   ("L5", shared_lines["L5"]),
-    # ]
-    
-    # Scenario 5: Cross-wired connections
     lines_controller1 = [
       ("L1", shared_lines["L1"]),
-      ("L2", shared_lines["L3"]),  # Cross-wired
-      ("L3", shared_lines["L2"]),  # Cross-wired
+      ("L2", shared_lines["L2"]),
+      ("L3", shared_lines["L3"]),
       ("L4", shared_lines["L4"]),
+      ("L5", shared_lines["L5"]),
+      ("L6", shared_lines["L6"]),
+      ("L7", shared_lines["L7"]),
+      ("L8", shared_lines["L8"]),
     ]
     
     lines_controller2 = [
       ("L1", shared_lines["L1"]),
-      ("L2", shared_lines["L2"]),
       ("L3", shared_lines["L3"]),
-      ("L4", shared_lines["L5"]),  # Different line
-     ]
+      ("L5", shared_lines["L5"]),
+    ]
     
-    mcu1 = MCU("A", lines_controller1, manager)
-    mcu2 = MCU("B", lines_controller2, manager)
+    mcu1 = MCU("A", lines_controller1, manager, output_queue)
+    mcu2 = MCU("B", lines_controller2, manager, output_queue)
 
     mcu1.start()
     mcu2.start()
 
+    # Collect pin data from MCUs
+    mcu_results = {}
+    completed_mcus = set()
+    
     try:
-        sleep(20)
+        start_time = perf_counter()
+        while len(completed_mcus) < 2 and (perf_counter() - start_time) < 25:
+            try:
+                # Check for data from MCUs with timeout
+                data = output_queue.get(timeout=1.0)
+                mcu_name = data['mcu_name']
+                
+                if mcu_name not in mcu_results:
+                    mcu_results[mcu_name] = {'pins': [], 'status': 'RUNNING'}
+                
+                if data['status'] == 'COMPLETED':
+                    completed_mcus.add(mcu_name)
+                    mcu_results[mcu_name]['status'] = 'COMPLETED'
+                    mcu_results[mcu_name]['white_list'] = data['white_list']
+                    mcu_results[mcu_name]['black_list'] = data['black_list']
+                elif 'pin_data' in data:
+                    mcu_results[mcu_name]['pins'].append(data)
+                    
+            except:
+                # Timeout or empty queue, continue
+                continue
+                
     finally:
         mcu1.stop()
         mcu2.stop()
         mcu1.join()
         mcu2.join()
     
+    # Print final summary
+    
+    for mcu_name, results in mcu_results.items():
+        print(f"\nMCU {mcu_name}:")
+        print(f"Status: {results['status']}")
+        if 'white_list' in results:
+            print(f"Working pins: {results['white_list']}")
+            print(f"Failed pins: {results['black_list']}")
+        print(f"Pin test details ({len(results['pins'])} tests):")
+        for pin_result in results['pins']:
+            pd = pin_result['pin_data']
+            print(f"  {pd['name']}: {pin_result['status']} as {pd['role']}")
+            
+    
+    
     # Log end state for all lines
     for line in shared_lines.values():
         line.log_end()
+        
     # Plotting
     plotter = MultiLinePlotter([])
     
-    
-    #Add all lines to the plotter
+    # Add all lines to the plotter
     for name, line in shared_lines.items():
         plotter.add_line(line)
     
-    
     plotter.plot_all()
-    
