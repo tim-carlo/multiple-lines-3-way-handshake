@@ -24,7 +24,7 @@ MAYBE_RESPONDER = 5
 
 TIMEOUT_RESPONDER = 2.0  # Timeout for responder to wait for SYN
 TIMEOUT_SYN_ACK = 2.0  # Timeout for initiator to wait for SYN_ACK
-TIMEOUT_ACK = 2.0  # Timeout for responder to wait for ACK
+TIMEOUT_ACK = 2.5  # Timeout for responder to wait for ACK
 
 
 MAXIMUM_NUMBER_OF_FALSE_RESPONSES = 3  # Maximum number of false responses before giving up
@@ -42,6 +42,7 @@ class PinData:
         self.num_false_responses = 0  # Counter for false responses
         
         self.blacklisted = False # Flag to indicate if this pin is blacklisted
+        self.successful = False  # Flag to indicate if this pin has been successfully tested
         
     def set_ack(self, value):
         self.ack = value
@@ -55,21 +56,17 @@ class PinData:
     
     def set_blacklisted(self, value):
         self.blacklisted = value
+    def set_successful(self, value):
+        self.successful = value
     
     def setnum_false_responses(self, value):
         self.num_false_responses = value
-
-    def tested(self):
-        return self.ack or self.syn or self.syn_ack
-    
-    def works_successfully(self):
-        return self.ack and self.syn_ack and self.role
     
     def is_blacklisted(self):
         return self.num_false_responses >= MAXIMUM_NUMBER_OF_FALSE_RESPONSES or self.blacklisted
     
     def is_tested(self):
-        return self.tested() or self.is_blacklisted()
+        return self.successful or self.is_blacklisted()
     
     def to_dict(self):
         return {
@@ -160,6 +157,7 @@ class MCU:
         self.p2.join()
 
     def stop(self):
+        print(f"Stopping MCU {self.name}...")
         self.stop_event.set()
         self.interrupt_event.set()
 
@@ -351,6 +349,7 @@ class MCU:
             elif state == SUCCESS:
                 print(f"[{self.name}] ✅ {self.current_line} works as {self.role.value}", flush=True)
                 self.pin_data[self.current_line].set_role(self.role.value)
+                self.pin_data[self.current_line].set_successful(True)
                 
                 self._reset_state()
 
@@ -422,10 +421,13 @@ class MCU:
                     print(f"[{self.name}] Line {name} pulled low after {duration:.2f} ms", flush=True)
                     if abs(duration - SYN_DURATION) < TOLERANCE:
                         etype = "SYN"
+                        print(f"[{self.name}]------- Line {name} sending SYN", flush=True)
                     elif abs(duration - SYN_ACK_DURATION) < TOLERANCE:
                         etype = "SYN_ACK"
+                        print(f"[{self.name}]------- Line {name} sending SYN_ACK", flush=True)
                     elif abs(duration - ACK_DURATION) < TOLERANCE:
                         etype = "ACK"
+                        print(f"[{self.name}]------- Line {name} sending ACK", flush=True)
                     else:
                         etype = None
 
