@@ -27,7 +27,13 @@ TIMEOUT_SYN_ACK = 2.0  # Timeout for initiator to wait for SYN_ACK
 TIMEOUT_ACK = 2.5  # Timeout for responder to wait for ACK
 
 
-MAXIMUM_NUMBER_OF_FALSE_RESPONSES = 3  # Maximum number of false responses before giving up
+MAXIMUM_NUMBER_OF_FALSE_RESPONSES = 2  # Maximum number of false responses before giving up
+
+ERROR_REASON_BLACKLISTED = 'blacklisted'
+ERROR_REASON_DISTURBED = 'disturbed'
+ERROR_REASON_TIMEOUT = 'timeout'
+
+
 
 
 
@@ -43,6 +49,7 @@ class PinData:
         
         self.blacklisted = False # Flag to indicate if this pin is blacklisted
         self.successful = False  # Flag to indicate if this pin has been successfully tested
+        self.error_reason = None  # Reason for failure, if any
         
     def set_ack(self, value):
         self.ack = value
@@ -56,11 +63,15 @@ class PinData:
     
     def set_blacklisted(self, value):
         self.blacklisted = value
+        self.error_reason = ERROR_REASON_BLACKLISTED if value else None
     def set_successful(self, value):
         self.successful = value
     
-    def setnum_false_responses(self, value):
-        self.num_false_responses = value
+    def increment_false_responses(self):
+        self.num_false_responses += 1
+        if self.num_false_responses >= MAXIMUM_NUMBER_OF_FALSE_RESPONSES:
+            self.error_reason = ERROR_REASON_DISTURBED
+        
     
     def is_blacklisted(self):
         return self.num_false_responses >= MAXIMUM_NUMBER_OF_FALSE_RESPONSES or self.blacklisted
@@ -69,14 +80,16 @@ class PinData:
         return self.successful or self.is_blacklisted()
     
     def to_dict(self):
-        return {
+       return {
             'name': self.name,
             'ack': self.ack,
             'syn': self.syn,
             'syn_ack': self.syn_ack,
             'role': self.role,
             'num_false_responses': self.num_false_responses,
-            'blacklisted': self.blacklisted
+            'blacklisted': self.blacklisted,
+            'successful': self.successful,
+            'error_reason': self.error_reason
         }
     
     def __eq__(self, other):
@@ -101,11 +114,7 @@ class MCU:
         
         self.stop_event = Event()
         self.output_queue = output_queue  # Queue to send data to main process
-
-        self.white_list = manager.list()
-        self.black_list = manager.list()
-        
-        self.disturbed_lines = manager.list()
+    
         
         self.all_lines = {ln: obj for ln, obj in line_names}
         
@@ -163,8 +172,7 @@ class MCU:
 
     def _run_logic(self):
         print(f"TEST: {self.name} starting logic with {len(self.all_lines)} lines")
-        
-        tested = set()
+
         
         slot = None
         slot_start = None
@@ -172,7 +180,7 @@ class MCU:
         responding_timeout = None
     
 
-        while not all(self.pin_data[name].is_tested() for name in self.pin_data):
+        while not all(self.pin_data[name].is_tested() for name in self.pin_data) and not self.stop_event.is_set():
             self._process_interrupts()
             state = self.state.value
 
@@ -190,7 +198,7 @@ class MCU:
                 while (perf_counter() - slot_start) < slot / 1000.0 and self.state.value == INIT:
                     active_lines = [name for name, line in self.all_lines.items() if line.state() == 1]
                     
-                    if active_lines:
+                    if active_lines and not self.pin_data[active_lines[0]].is_blacklisted():
                         #TODO: How to handle multiple active lines?
     
                         self.current_line = active_lines[0]
@@ -219,7 +227,7 @@ class MCU:
                     other_active_lines = [name for name, line in self.all_lines.items() 
                                         if name != self.current_line and line.state() == 1]
                     
-                    if other_active_lines:
+                    if other_active_lines and not self.pin_data[other_active_lines[0]].is_blacklisted():
                         self.current_line_obj.release(self.name)
                         self.set_curent_line.value = False
                         
@@ -246,8 +254,7 @@ class MCU:
                     self._process_interrupts()
 
             
-                    if self.received_syn.value:
-                        self.current_line = self.received_syn_on.value
+                    if self.received_syn.value and self.received_syn_on.value == self.current_line:
                         print(f"[{self.name}] SYN received on {self.current_line}, switching to RESPONDER", flush=True)
                         self.received_syn.value = False
                         self.state.value = RESPONDER
@@ -256,6 +263,7 @@ class MCU:
                         break
                 else:
                     print(f"[{self.name}] Timeout waiting for SYN on {self.current_line}, returning to INIT", flush=True)
+                    self.pin_data[self.current_line].increment_false_responses()
                     self._reset_state()
                         
             elif state == INITIATOR:
@@ -268,7 +276,7 @@ class MCU:
                     
                     other_active_lines = [name for name, line in self.all_lines.items() 
                                         if name != self.current_line and line.state() == 1]
-                    if other_active_lines:
+                    if other_active_lines and not self.pin_data[other_active_lines[0]].is_blacklisted():
                         self.current_line = other_active_lines[0]
                         print(f"[{self.name}] Other line {self.current_line} is high, switching to MAYBE_RESPONDER", flush=True)
                         self.state.value = MAYBE_RESPONDER
@@ -351,25 +359,25 @@ class MCU:
                 self.pin_data[self.current_line].set_role(self.role.value)
                 self.pin_data[self.current_line].set_successful(True)
                 
+                self._send_pin_data_to_main(self.pin_data[self.current_line], 'WORKING')
                 self._reset_state()
 
             elif state == FAILED:
                 print(f"[{self.name}] ❌ {self.current_line} failed as {self.role.value}", flush=True)
-                self.pin_data[self.current_line].set_blacklisted(True)
+                self.pin_data[self.current_line].set_blacklisted()
+                
+                self._send_pin_data_to_main(self.pin_data[self.current_line], 'FAILED')
                 
                 self._reset_state()
-
-        # Send completion signal
         if self.output_queue:
-            self.output_queue.put({
-                'mcu_name': self.name,
-                'status': 'COMPLETED',
-                'timestamp': perf_counter(),
-                'role': self.role.value,
-                'white_list': list(self.white_list),
-                'black_list': list(self.black_list),
-                
-            })
+            if all(pd.is_tested() for pd in self.pin_data.values()):
+                self.output_queue.put({
+                    'mcu_name': self.name,
+                    'status': 'COMPLETED',
+                    'timestamp': perf_counter(),
+                    'white_list': [pd.to_dict() for pd in self.pin_data.values() if pd.role == 'initiator' and pd.successful],
+                    'black_list': [pd.to_dict() for pd in self.pin_data.values() if pd.is_blacklisted()]
+                })
 
     def _reset_state(self):
         self.state.value = INIT
@@ -418,7 +426,6 @@ class MCU:
                     durations[name] = perf_counter()
                 elif prev == 1 and state == 0 and durations[name] is not None:
                     duration = (perf_counter() - durations[name]) * 1000
-                    print(f"[{self.name}] Line {name} pulled low after {duration:.2f} ms", flush=True)
                     if abs(duration - SYN_DURATION) < TOLERANCE:
                         etype = "SYN"
                     elif abs(duration - SYN_ACK_DURATION) < TOLERANCE:
@@ -427,7 +434,6 @@ class MCU:
                         etype = "ACK"
                     else:
                         etype = None
-
                     if etype:
                         self.interrupt_queue.put((name, etype, duration))
                     durations[name] = None

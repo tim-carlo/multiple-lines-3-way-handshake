@@ -40,8 +40,10 @@ if __name__ == "__main__":
     mcu1 = MCU("A", lines_controller1, manager, output_queue)
     mcu2 = MCU("B", lines_controller2, manager, output_queue)
     
+    bridge1 = Bridge([shared_lines["L1"], shared_lines["L2"]], name="Bridge1")
+    
      #start the pinger
-   # pinger1 = Pinger(shared_lines["L2"], interval=1.0, pulse_width=0.1)
+   # pinger1 = Pinger(shared_lines["L1"], interval=1.0, pulse_width=0.1)
    # pinger2 = Pinger(shared_lines["L10"], interval=1.0, pulse_width=0.1)
     
     
@@ -49,7 +51,7 @@ if __name__ == "__main__":
     mcu1.start()
     mcu2.start()
     
-  #  pinger1.start()
+   # pinger1.start()
   #  pinger2.start()
     
     
@@ -88,7 +90,7 @@ if __name__ == "__main__":
         mcu2.stop()
         mcu1.join()
         mcu2.join()
-    #    pinger1.stop()
+      #  pinger1.stop()
     #    pinger2.stop()
     #    pinger1.join()
     #    pinger2.join()
@@ -104,7 +106,7 @@ if __name__ == "__main__":
         print(f"Pin test details ({len(results['pins'])} tests):")
         for pin_result in results['pins']:
             pd = pin_result['pin_data']
-            print(f"  {pd['name']}: {pin_result['status']} as {pd['role']}")
+            print(f"    Complete pin data: {pd}")
             
     
     
