@@ -421,13 +421,10 @@ class MCU:
                     print(f"[{self.name}] Line {name} pulled low after {duration:.2f} ms", flush=True)
                     if abs(duration - SYN_DURATION) < TOLERANCE:
                         etype = "SYN"
-                        print(f"[{self.name}]------- Line {name} sending SYN", flush=True)
                     elif abs(duration - SYN_ACK_DURATION) < TOLERANCE:
                         etype = "SYN_ACK"
-                        print(f"[{self.name}]------- Line {name} sending SYN_ACK", flush=True)
                     elif abs(duration - ACK_DURATION) < TOLERANCE:
                         etype = "ACK"
-                        print(f"[{self.name}]------- Line {name} sending ACK", flush=True)
                     else:
                         etype = None
 
